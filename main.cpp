@@ -10,7 +10,7 @@ const int PORT = 9007;  // 和原版的 9006 区分开，避免冲突
 const char* HTML =
     "HTTP/1.1 200 OK\r\n"
     "Content-Type: text/html\r\n"
-    "Content-Length: 33\r\n"
+    "Content-Length: 32\r\n"
     "\r\n"
     "<h1>Hello, my first server!</h1>";
 
