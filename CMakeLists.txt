@@ -1,0 +1,4 @@
+cmake_minimum_required(VERSION 3.10)
+project(mywebserver)
+set(CMAKE_CXX_STANDARD 17)
+add_executable(mywebserver main.cpp)
