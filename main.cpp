@@ -1,10 +1,13 @@
-#include <cstring>
-#include <iostream>
-#include <netinet/in.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/epoll.h>
 #include <unistd.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 const int PORT = 9007;  // 和原版的 9006 区分开，避免冲突
+const int MAX_EVENTS = 10;
 
 // 固定的 HTTP 响应。以后会学会自己解析请求、动态生成响应
 const char* HTML =
@@ -14,45 +17,79 @@ const char* HTML =
     "\r\n"
     "<h1>Hello, my first server!</h1>";
 
-int main() {
-    // 1. 创建"听筒"：socket
+int main() 
+{
+    // ===== 第 1 段：开门准备（和昨天一模一样）=====
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        std::cerr << "socket 创建失败" << std::endl;
-        return 1;
-    }
+    if (listen_fd < 0) { perror("socket"); exit(1);} 
 
-    // 2. 绑定地址和端口：告诉系统"我在 9007 号门牌等客人"
+    int reuse = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);  // 允许任何网卡接入
     addr.sin_port = htons(PORT);
-    int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {perror("bind"); exit(1); }
+    if (listen(listen_fd, 5) < 0) {perror("listen"); exit(1); }
+    printf("我的 epoll 服务器已启动！ 端口 %d\n", PORT);
 
-    if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cerr << "bind 失败（端口可能被占用）" << std::endl;
-        return 1;
-    }
+    // ===== 第 2 段：装总台（新！）=====
+    int epfd = epoll_create1(0);
 
-    // 3. 开始"接听"：listen，最多 5 个客人排队
-    if (listen(listen_fd, 5) < 0) {
-        std::cerr << "listen 失败" << std::endl;
-        return 1;
-    }
-    std::cout << "我的服务器已启动！浏览器访问 http://localhost:" << PORT << std::endl;
+    // ===== 第 3 段：把大门登记进总台（新！）=====
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = listen_fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
 
-    // 4. 无限循环：接一个客人 -> 服务完 -> 再接下一个
-    while (true) {
-        int conn_fd = accept(listen_fd, nullptr, nullptr);  // 等一个客人上门
-        if (conn_fd < 0) {
-            std::cerr << "accept 失败" << std::endl;
-            continue;
+    // ===== 第 4 段：主循环——坐着等名单（换掉了原来的循环）=====
+    epoll_event events[MAX_EVENTS]; // 名单：今晚谁有事
+    char buf[4096];
+    
+    while (true) 
+    {
+        // 坐着等。-1 = 没事就一直歇着；一有事立刻醒，n = 有几桌
+        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        
+        for (int i = 0; i < n; i++)
+        {
+            int fd = events[i].data.fd;
+
+            if (fd == listen_fd)
+            {
+                sockaddr_in cli{};
+                socklen_t len = sizeof(cli);
+                int conn_fd = accept(listen_fd, (sockaddr*)&cli, &len);
+                printf("新客人来了！ 桌号 %d\n", conn_fd);
+
+                // 把新桌子登记进总台（你答的那句"记录和监听"）
+                epoll_event cev{};
+                cev.events = EPOLLIN;
+                cev.data.fd = conn_fd;
+                epoll_ctl(epfd, EPOLL_CTL_ADD, conn_fd, &cev);
+            }
+            else
+            {
+                // 老客人开口说话了：读他的请求
+                int bytes = read(fd, buf, sizeof(buf));
+
+                if (bytes <= 0)
+                {
+                    // 读到 0 = 客人悄悄走了：注销桌位、收桌子
+                    printf("客人 %d 走了\n", fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                    close(fd);
+                }
+                else
+                {
+                    // 正常点单：回固定页面，然后送客
+                    printf("客人 %d 说了 %d 个字节\n", fd, bytes);
+                    write(fd, HTML, strlen(HTML));
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                    close(fd);
+                }
+            }
         }
-        char buf[1024] = {0};
-        read(conn_fd, buf, sizeof(buf));   // 收下请求（暂时不看内容）
-        write(conn_fd, HTML, strlen(HTML));  // 回一个固定页面
-        close(conn_fd);                    // 送客
     }
-    return 0;
 }
