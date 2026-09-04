@@ -5,9 +5,17 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <csignal>
+#include <cerrno>
 
 const int PORT = 9007;  // 和原版的 9006 区分开，避免冲突
 const int MAX_EVENTS = 10;
+volatile sig_atomic_t g_stop = 0;
+
+void on_signal(int)
+{
+    g_stop = 1;   
+}
 
 // 固定的 HTTP 响应。以后会学会自己解析请求、动态生成响应
 const char* HTML =
@@ -19,6 +27,15 @@ const char* HTML =
 
 int main() 
 {
+    signal(SIGINT, SIG_IGN);
+
+    struct sigaction sa{};
+    sa.sa_handler = on_signal;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
     // ===== 第 1 段：开门准备（和昨天一模一样）=====
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { perror("socket"); exit(1);} 
@@ -47,10 +64,16 @@ int main()
     epoll_event events[MAX_EVENTS]; // 名单：今晚谁有事
     char buf[4096];
     
-    while (true) 
+    while (!g_stop) 
     {
         // 坐着等。-1 = 没事就一直歇着；一有事立刻醒，n = 有几桌
         int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        if (n < 0) 
+        {
+            if (errno == EINTR) continue; // 被信号打断了，继续等
+            perror("epoll_wait");
+            break;
+        }
         
         for (int i = 0; i < n; i++)
         {
@@ -92,4 +115,10 @@ int main()
             }
         }
     }
+
+    // ===== 优雅打烊（新！）=====
+    close(listen_fd);
+    close(epfd);
+    printf("我的 epoll 服务器已关闭！\n");
+    return 0;
 }
