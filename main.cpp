@@ -67,6 +67,8 @@ void handle_request(int fd, const char* method, const char* path)
 
 int main() 
 {
+    signal(SIGPIPE, SIG_IGN);   // 客人拒收也保命：向断开的连接 write 不杀进程
+ 
     struct sigaction sa{};
     sa.sa_handler = on_signal;
     sa.sa_flags = 0;
