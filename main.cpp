@@ -3,6 +3,7 @@
 #include <sys/epoll.h>
 #include <unistd.h>
 #include <cstring>
+#include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
@@ -17,18 +18,55 @@ void on_signal(int)
     g_stop = 1;   
 }
 
-// 固定的 HTTP 响应。以后会学会自己解析请求、动态生成响应
-const char* HTML =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: text/html\r\n"
-    "Content-Length: 32\r\n"
-    "\r\n"
-    "<h1>Hello, my first server!</h1>";
+// 响应工厂：把状态行和正文打包成合法的 HTTP 响应，返回总长度
+int make_response(char* out, const char* status, const char* body)
+{
+    return sprintf(out,
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
+        "\r\n"
+        "%s",
+        status, strlen(body), body);
+}
+
+// 路由：看客人要什么，决定端什么菜
+void handle_request(int fd, const char* method, const char* path)
+{
+    char out[8192];
+    int len;
+
+    if (strcmp(method, "GET") != 0)
+    {
+        len = make_response(out, "405 Method Not Allowed",
+                            "<h1>405 我只听得懂 GET</h1>");
+    }
+    else if (strcmp(path, "/") == 0)
+    {
+        len = make_response(out, "200 OK", "<h1>欢迎光临首页！</h1>");
+    }
+    else if (strcmp(path, "/hello") == 0)
+    {
+        len = make_response(out, "200 OK", "<h1>你好，这里是 /hello</h1>");
+    }
+    else if (strcmp(path, "/time") == 0)
+    {
+        char tbuf[64], body[128];
+        time_t t = time(nullptr);
+        strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", localtime(&t));
+        snprintf(body, sizeof(body), "<h1>服务器时间：%s</h1>", tbuf);
+        len = make_response(out, "200 OK", body);
+    }
+    else
+    {
+        len = make_response(out, "404 Not Found",
+                            "<h1>404：菜单上没有这道菜</h1>");
+    }
+    write(fd, out, len);
+}
 
 int main() 
 {
-    signal(SIGINT, SIG_IGN);
-
     struct sigaction sa{};
     sa.sa_handler = on_signal;
     sa.sa_flags = 0;
@@ -94,21 +132,33 @@ int main()
             }
             else
             {
-                // 老客人开口说话了：读他的请求
+                // 先听客人说！把数据读进 buf —— 上一版把这行弄丢了
                 int bytes = read(fd, buf, sizeof(buf));
-
                 if (bytes <= 0)
                 {
-                    // 读到 0 = 客人悄悄走了：注销桌位、收桌子
+                    // 读到 0 = 客人悄悄走了
                     printf("客人 %d 走了\n", fd);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
                 }
                 else
                 {
-                    // 正常点单：回固定页面，然后送客
-                    printf("客人 %d 说了 %d 个字节\n", fd, bytes);
-                    write(fd, HTML, strlen(HTML));
+                    // 从请求里抠出方法（GET/POST）和路径（/xxx）
+                    char method[16], path[256];
+                    int cnt = sscanf(buf, "%15s %255s", method, path);
+                    if (cnt == 2)
+                    {
+                        printf("客人 %d 点单：%s %s\n", fd, method, path);
+                        handle_request(fd, method, path);
+                    }
+                    else
+                    {
+                        char out[1024];
+                        int len = make_response(out, "400 Bad Request",
+                                                "<h1>400 听不懂你在说什么</h1>");
+                        write(fd, out, len);
+                    }
+                    // 还是小卖部模式：回完话就关桌（keep-alive 以后再上）
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
                 }
