@@ -9,6 +9,17 @@
 #include <csignal>
 #include <cerrno>
 
+const int TICK_SEC    = 3;   // 闹钟每 3 秒响一次
+const int TIMEOUT_SEC = 6;   // 连续 6 秒没点单就收桌
+
+//volatile：告诉编译器变量可能被外部修改，每次访问都从内存读取，避免优化。
+volatile sig_atomic_t g_tick = 0;   // 闹钟旗：handler 立旗，主循环拔旗
+
+void on_alarm(int) {
+    g_tick = 1;            // 只立旗，别的什么都不干
+    alarm(TICK_SEC);       // 续上下一次发条，闹钟才能一直响
+}
+
 const int PORT = 9007;  // 和原版的 9006 区分开，避免冲突
 const int MAX_EVENTS = 10;
 volatile sig_atomic_t g_stop = 0;
@@ -56,11 +67,14 @@ void handle_request(int fd, const char* method, const char* path, bool keep_aliv
     write(fd, out, len);
 }
 
-
 int main() 
 {
     signal(SIGPIPE, SIG_IGN);   // 客人拒收也保命：向断开的连接 write 不杀进程
- 
+    signal(SIGALRM, on_alarm);   // 行尾分号！SIG-ALRM（闹钟），别看成别的
+    alarm(TICK_SEC);             // 上第一次发条
+
+    time_t last_active[1024] = {0};   // 桌子登记簿：下标=桌号，值=最后点单时刻，0=空桌
+
     struct sigaction sa{};
     sa.sa_handler = on_signal;
     sa.sa_flags = 0;
@@ -98,43 +112,69 @@ int main()
     
     while (!g_stop) 
     {
-        // 坐着等。-1 = 没事就一直歇着；一有事立刻醒，n = 有几桌
-        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        if (g_tick) 
+        {                               // 保安挪到最顶上！先收桌再去等事件
+            g_tick = 0;
+            time_t now = time(nullptr);
+            for (int fd = 0; fd < 1024; fd++) 
+            {
+                if (last_active[fd] != 0 && now - last_active[fd] >= TIMEOUT_SEC) 
+                {
+                    printf("客人 %d 超时未点单，收桌！\n", fd);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                    close(fd);
+                    last_active[fd] = 0;            // 销户
+                }
+            }
+        }
+
+        int n = epoll_wait(epfd, events, 64, -1);   // 门卫睡觉等事件
+
         if (n < 0) 
         {
-            if (errno == EINTR) continue; // 被信号打断了，继续等
-            perror("epoll_wait");
+            if (errno == EINTR) continue;           // 只是闹钟拍醒，回顶部扫一圈再睡
+            printf("epoll_wait 出错 errno=%d，收摊\n", errno);   // 退出前必须留句话
             break;
         }
-        
-        for (int i = 0; i < n; i++)
+
+        for (int i = 0; i < n; i++) 
         {
-            int fd = events[i].data.fd;
-
-            if (fd == listen_fd)
+            if (events[i].data.fd == listen_fd) 
             {
-                sockaddr_in cli{};
-                socklen_t len = sizeof(cli);
-                int conn_fd = accept(listen_fd, (sockaddr*)&cli, &len);
-                printf("新客人来了！ 桌号 %d\n", conn_fd);
-
-                // 把新桌子登记进总台（你答的那句"记录和监听"）
-                epoll_event cev{};
-                cev.events = EPOLLIN;
-                cev.data.fd = conn_fd;
-                epoll_ctl(epfd, EPOLL_CTL_ADD, conn_fd, &cev);
-            }
+                struct sockaddr_in addr;
+                socklen_t len = sizeof(addr);
+                int fd = accept(listen_fd, (struct sockaddr*)&addr, &len);
+                if (fd < 0 || fd >= 1024) continue;     // 【新增】accept 可能失败！拿 -1 或超大桌号直接跳过
+                printf("新客人来了！桌号 %d\n", fd);
+                ev.events = EPOLLIN;
+                ev.data.fd = fd;
+                epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+                last_active[fd] = time(nullptr);
+            } 
             else 
             {
-                int bytes = read(fd, buf, sizeof(buf) - 1);    // 少读 1 字节，给结尾的 0 留位置
-                if (bytes <= 0) {
+                int fd = events[i].data.fd;
+                if (last_active[fd] == 0) continue;     // 【新增】保险丝：桌号 0=已被保安收走，过期事件跳过
+
+                int bytes = read(fd, buf, sizeof(buf) - 1);
+                if (bytes == 0) 
+                {                       // 客人礼貌告别
                     printf("客人 %d 走了\n", fd);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
+                    last_active[fd] = 0;
+                } 
+                else if (bytes < 0) 
+                {                 // 【新增】出事先验明正身，不再一律当走了
+                    if (errno == EINTR) continue;       // 闹钟路过，客人还在
+                    printf("客人 %d 出状况（errno=%d），收桌\n", fd, errno);
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                    close(fd);
+                    last_active[fd] = 0;
                 } 
                 else 
                 {
-                    buf[bytes] = 0;    // 关键新增行！截断成 C 字符串，行尾分号
+                    buf[bytes] = 0;
                     char method[16], path[256];
                     int cnt = sscanf(buf, "%15s %255s", method, path);
                     if (cnt == 2) 
@@ -142,19 +182,22 @@ int main()
                         bool keep_alive = (strstr(buf, "Connection: close") == nullptr);
                         printf("客人 %d 点单：%s %s\n", fd, method, path);
                         handle_request(fd, method, path, keep_alive);
-                    } else 
+                        last_active[fd] = time(nullptr);   // 点单续命
+                    } 
+                    else 
                     {
                         char out[1024];
                         int len = make_response(out, "400 Bad Request", "<h1>400 听不懂你在说什么</h1>", false);
                         write(fd, out, len);
                         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                         close(fd);
+                        last_active[fd] = 0;
                     }
-                    // 注意：这里不再关桌！连接继续留在 epoll 里等下一单
                 }
             }
         }
     }
+
 
     // ===== 优雅打烊（新！）=====
     close(listen_fd);
