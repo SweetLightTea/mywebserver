@@ -19,51 +19,43 @@ void on_signal(int)
 }
 
 // 响应工厂：把状态行和正文打包成合法的 HTTP 响应，返回总长度
-int make_response(char* out, const char* status, const char* body)
-{
+int make_response(char* out, const char* status, const char* body, bool keep_alive) {
     return sprintf(out,
         "HTTP/1.1 %s\r\n"
-        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"    // 分号在 html 和 charset 之间
         "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"                            // 冒号在 Connection 后面
         "\r\n"
         "%s",
-        status, strlen(body), body);
+        status, strlen(body),
+        keep_alive ? "keep-alive" : "close",            // 留桌就回 keep-alive
+        body);
 }
 
-// 路由：看客人要什么，决定端什么菜
-void handle_request(int fd, const char* method, const char* path)
-{
-    char out[8192];
-    int len;
 
+// 路由：看客人要什么，决定端什么菜
+void handle_request(int fd, const char* method, const char* path, bool keep_alive) 
+{
+    char out[8192]; int len;
     if (strcmp(method, "GET") != 0)
-    {
-        len = make_response(out, "405 Method Not Allowed",
-                            "<h1>405 我只听得懂 GET</h1>");
-    }
+        len = make_response(out, "405 Method Not Allowed", "<h1>405 我只听得懂 GET</h1>", keep_alive);
     else if (strcmp(path, "/") == 0)
-    {
-        len = make_response(out, "200 OK", "<h1>欢迎光临首页！</h1>");
-    }
+        len = make_response(out, "200 OK", "<h1>欢迎光临首页！</h1>", keep_alive);
     else if (strcmp(path, "/hello") == 0)
-    {
-        len = make_response(out, "200 OK", "<h1>你好，这里是 /hello</h1>");
-    }
-    else if (strcmp(path, "/time") == 0)
+        len = make_response(out, "200 OK", "<h1>你好，这里是 /hello</h1>", keep_alive);
+    else if (strcmp(path, "/time") == 0) 
     {
         char tbuf[64], body[128];
         time_t t = time(nullptr);
         strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", localtime(&t));
         snprintf(body, sizeof(body), "<h1>服务器时间：%s</h1>", tbuf);
-        len = make_response(out, "200 OK", body);
-    }
+        len = make_response(out, "200 OK", body, keep_alive);
+    } 
     else
-    {
-        len = make_response(out, "404 Not Found",
-                            "<h1>404：菜单上没有这道菜</h1>");
-    }
+        len = make_response(out, "404 Not Found", "<h1>404：菜单上没有这道菜</h1>", keep_alive);
     write(fd, out, len);
 }
+
 
 int main() 
 {
@@ -132,37 +124,33 @@ int main()
                 cev.data.fd = conn_fd;
                 epoll_ctl(epfd, EPOLL_CTL_ADD, conn_fd, &cev);
             }
-            else
+            else 
             {
-                // 先听客人说！把数据读进 buf —— 上一版把这行弄丢了
-                int bytes = read(fd, buf, sizeof(buf));
-                if (bytes <= 0)
-                {
-                    // 读到 0 = 客人悄悄走了
+                int bytes = read(fd, buf, sizeof(buf) - 1);    // 少读 1 字节，给结尾的 0 留位置
+                if (bytes <= 0) {
                     printf("客人 %d 走了\n", fd);
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
-                }
-                else
+                } 
+                else 
                 {
-                    // 从请求里抠出方法（GET/POST）和路径（/xxx）
+                    buf[bytes] = 0;    // 关键新增行！截断成 C 字符串，行尾分号
                     char method[16], path[256];
                     int cnt = sscanf(buf, "%15s %255s", method, path);
-                    if (cnt == 2)
+                    if (cnt == 2) 
                     {
+                        bool keep_alive = (strstr(buf, "Connection: close") == nullptr);
                         printf("客人 %d 点单：%s %s\n", fd, method, path);
-                        handle_request(fd, method, path);
-                    }
-                    else
+                        handle_request(fd, method, path, keep_alive);
+                    } else 
                     {
                         char out[1024];
-                        int len = make_response(out, "400 Bad Request",
-                                                "<h1>400 听不懂你在说什么</h1>");
+                        int len = make_response(out, "400 Bad Request", "<h1>400 听不懂你在说什么</h1>", false);
                         write(fd, out, len);
+                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                        close(fd);
                     }
-                    // 还是小卖部模式：回完话就关桌（keep-alive 以后再上）
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                    close(fd);
+                    // 注意：这里不再关桌！连接继续留在 epoll 里等下一单
                 }
             }
         }
