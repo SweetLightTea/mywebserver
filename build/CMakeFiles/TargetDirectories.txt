@@ -1,3 +1,0 @@
-/home/SweetLightTea/mywebserver/build/CMakeFiles/mywebserver.dir
-/home/SweetLightTea/mywebserver/build/CMakeFiles/edit_cache.dir
-/home/SweetLightTea/mywebserver/build/CMakeFiles/rebuild_cache.dir

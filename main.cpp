@@ -2,49 +2,50 @@
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <unistd.h>
+#include <fcntl.h>            // 【L20】O_NONBLOCK / F_GETFL / F_SETFL
 #include <cstring>
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
 #include <csignal>
 #include <cerrno>
+#include <mutex>              // 【L19】日志锁
+#include "log.h"              // 【L19】日志宏
+#include "threadpool.h"       // 【L17】线程池
 
-const int TICK_SEC    = 3;   // 闹钟每 3 秒响一次
-const int TIMEOUT_SEC = 6;   // 连续 6 秒没点单就收桌
+const int TICK_SEC    = 3;
+const int TIMEOUT_SEC = 6;
 
-//volatile：告诉编译器变量可能被外部修改，每次访问都从内存读取，避免优化。
-volatile sig_atomic_t g_tick = 0;   // 闹钟旗：handler 立旗，主循环拔旗
+volatile sig_atomic_t g_tick = 0;
+void on_alarm(int) { g_tick = 1; alarm(TICK_SEC); }
 
-void on_alarm(int) {
-    g_tick = 1;            // 只立旗，别的什么都不干
-    alarm(TICK_SEC);       // 续上下一次发条，闹钟才能一直响
-}
-
-const int PORT = 9007;  // 和原版的 9006 区分开，避免冲突
+const int PORT = 9007;
 const int MAX_EVENTS = 10;
 volatile sig_atomic_t g_stop = 0;
+void on_signal(int) { g_stop = 1; }
 
-void on_signal(int)
+time_t last_active[1024] = {0};
+ThreadPool* g_pool = nullptr;
+int g_epfd = -1;
+
+std::mutex g_log_lock;        // 【L19】log.h 里 extern 声明的锁，本体在这
+
+// ========== 响应工厂 ==========
+int make_response(char* out, const char* status, const char* body, bool keep_alive) 
 {
-    g_stop = 1;   
-}
-
-// 响应工厂：把状态行和正文打包成合法的 HTTP 响应，返回总长度
-int make_response(char* out, const char* status, const char* body, bool keep_alive) {
     return sprintf(out,
         "HTTP/1.1 %s\r\n"
-        "Content-Type: text/html; charset=utf-8\r\n"    // 分号在 html 和 charset 之间
+        "Content-Type: text/html; charset=utf-8\r\n"
         "Content-Length: %zu\r\n"
-        "Connection: %s\r\n"                            // 冒号在 Connection 后面
+        "Connection: %s\r\n"
         "\r\n"
         "%s",
         status, strlen(body),
-        keep_alive ? "keep-alive" : "close",            // 留桌就回 keep-alive
+        keep_alive ? "keep-alive" : "close",
         body);
 }
 
-
-// 路由：看客人要什么，决定端什么菜
+// ========== 路由 ==========
 void handle_request(int fd, const char* method, const char* path, bool keep_alive) 
 {
     char out[8192]; int len;
@@ -67,13 +68,74 @@ void handle_request(int fd, const char* method, const char* path, bool keep_aliv
     write(fd, out, len);
 }
 
+// ========== 【L20】把 fd 切成非阻塞 ==========
+void set_nonblocking(int fd) 
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+// ========== 【L20 改】厨师干活：ET 循环版 ==========
+void do_read(int fd) 
+{
+    char buf[4096];
+    while (true) 
+    {                            // ET 铁律：循环读到 EAGAIN
+        int bytes = read(fd, buf, sizeof(buf) - 1);
+
+        if (bytes == 0) 
+        {                     // 客人礼貌告别
+            LOG_INFO("客人 %d 走了", fd);
+            epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            last_active[fd] = 0;
+            return;
+        }
+        if (bytes < 0) 
+        {
+            if (errno == EINTR) continue;     // 闹钟路过：重读
+            if (errno == EAGAIN) break;       // 读干了！跳出循环去挂回
+            LOG_WARN("客人 %d 出状况（errno=%d），收桌", fd, errno);
+            epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            last_active[fd] = 0;
+            return;
+        }
+
+        buf[bytes] = 0;
+        char method[16], path[256];
+        int cnt = sscanf(buf, "%15s %255s", method, path);
+        if (cnt == 2) 
+        {
+            bool keep_alive = (strstr(buf, "Connection: close") == nullptr);
+            LOG_INFO("厨师做菜：客人 %d 点 %s %s", fd, method, path);
+            handle_request(fd, method, path, keep_alive);
+            last_active[fd] = time(nullptr);
+        } 
+        else 
+        {
+            char out[1024];
+            int len = make_response(out, "400 Bad Request", "<h1>400 听不懂你在说什么</h1>", false);
+            write(fd, out, len);
+            epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, nullptr);
+            close(fd);
+            last_active[fd] = 0;
+            return;
+        }
+    }
+
+    // 走到这里 = 数据真读干了 → MOD 挂回（ET：下次有新数据才再报）
+    epoll_event ev{};
+    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    ev.data.fd = fd;
+    epoll_ctl(g_epfd, EPOLL_CTL_MOD, fd, &ev);
+}
+
 int main() 
 {
-    signal(SIGPIPE, SIG_IGN);   // 客人拒收也保命：向断开的连接 write 不杀进程
-    signal(SIGALRM, on_alarm);   // 行尾分号！SIG-ALRM（闹钟），别看成别的
-    alarm(TICK_SEC);             // 上第一次发条
-
-    time_t last_active[1024] = {0};   // 桌子登记簿：下标=桌号，值=最后点单时刻，0=空桌
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGALRM, on_alarm);
+    alarm(TICK_SEC);
 
     struct sigaction sa{};
     sa.sa_handler = on_signal;
@@ -82,58 +144,53 @@ int main()
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    // ===== 第 1 段：开门准备（和昨天一模一样）=====
+    // ===== 开门 =====
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) { perror("socket"); exit(1);} 
-
+    if (listen_fd < 0) { perror("socket"); exit(1); }
+    set_nonblocking(listen_fd);               // 【L20】大门也非阻塞（循环 accept 的前提）
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);  // 允许任何网卡接入
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(PORT);
-    if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {perror("bind"); exit(1); }
-    if (listen(listen_fd, 5) < 0) {perror("listen"); exit(1); }
-    printf("我的 epoll 服务器已启动！ 端口 %d\n", PORT);
+    if (bind(listen_fd, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); exit(1); }
+    if (listen(listen_fd, 5) < 0) { perror("listen"); exit(1); }
+    LOG_INFO("我的 epoll+线程池 服务器已启动！ 端口 %d", PORT);
 
-    // ===== 第 2 段：装总台（新！）=====
-    int epfd = epoll_create1(0);
+    g_pool = threadpool_create(3);
+    g_epfd = epoll_create1(0);
 
-    // ===== 第 3 段：把大门登记进总台（新！）=====
     epoll_event ev{};
-    ev.events = EPOLLIN;
+    ev.events = EPOLLIN | EPOLLET;            // 【L20】大门也用 ET → 循环 accept 接完一批
     ev.data.fd = listen_fd;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
+    epoll_ctl(g_epfd, EPOLL_CTL_ADD, listen_fd, &ev);
 
-    // ===== 第 4 段：主循环——坐着等名单（换掉了原来的循环）=====
-    epoll_event events[MAX_EVENTS]; // 名单：今晚谁有事
-    char buf[4096];
-    
+    epoll_event events[MAX_EVENTS];
+
     while (!g_stop) 
     {
         if (g_tick) 
-        {                               // 保安挪到最顶上！先收桌再去等事件
+        {
             g_tick = 0;
             time_t now = time(nullptr);
             for (int fd = 0; fd < 1024; fd++) 
             {
                 if (last_active[fd] != 0 && now - last_active[fd] >= TIMEOUT_SEC) 
                 {
-                    printf("客人 %d 超时未点单，收桌！\n", fd);
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                    LOG_INFO("客人 %d 超时未点单，收桌", fd);
+                    epoll_ctl(g_epfd, EPOLL_CTL_DEL, fd, nullptr);
                     close(fd);
-                    last_active[fd] = 0;            // 销户
+                    last_active[fd] = 0;
                 }
             }
         }
 
-        int n = epoll_wait(epfd, events, 64, -1);   // 门卫睡觉等事件
-
+        int n = epoll_wait(g_epfd, events, 64, -1);
         if (n < 0) 
         {
-            if (errno == EINTR) continue;           // 只是闹钟拍醒，回顶部扫一圈再睡
-            printf("epoll_wait 出错 errno=%d，收摊\n", errno);   // 退出前必须留句话
+            if (errno == EINTR) continue;
+            LOG_ERROR("epoll_wait 出错 errno=%d，收摊", errno);
             break;
         }
 
@@ -141,67 +198,39 @@ int main()
         {
             if (events[i].data.fd == listen_fd) 
             {
-                struct sockaddr_in addr;
-                socklen_t len = sizeof(addr);
-                int fd = accept(listen_fd, (struct sockaddr*)&addr, &len);
-                if (fd < 0 || fd >= 1024) continue;     // 【新增】accept 可能失败！拿 -1 或超大桌号直接跳过
-                printf("新客人来了！桌号 %d\n", fd);
-                ev.events = EPOLLIN;
-                ev.data.fd = fd;
-                epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-                last_active[fd] = time(nullptr);
+                sockaddr_in cli{};
+                socklen_t clen = sizeof(cli);
+                while (true) 
+                {                // 【L20】ET：一次报一批，必须循环 accept 到 EAGAIN
+                    int fd = accept(listen_fd, (sockaddr*)&cli, &clen);
+                    if (fd < 0) 
+                    {
+                        if (errno == EINTR) continue;   // 闹钟路过：再试
+                        break;                          // EAGAIN=接完了，走人
+                    }
+                    if (fd >= 1024) { close(fd); continue; }  // 桌号越界，请走
+                    LOG_INFO("新客人来了！桌号 %d", fd);
+                    set_nonblocking(fd);      // 【L20 关键】accept 不继承大门的非阻塞！必须单独切
+                    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                    ev.data.fd = fd;
+                    epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
+                    last_active[fd] = time(nullptr);
+                }
             } 
             else 
             {
                 int fd = events[i].data.fd;
-                if (last_active[fd] == 0) continue;     // 【新增】保险丝：桌号 0=已被保安收走，过期事件跳过
-
-                int bytes = read(fd, buf, sizeof(buf) - 1);
-                if (bytes == 0) 
-                {                       // 客人礼貌告别
-                    printf("客人 %d 走了\n", fd);
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                    close(fd);
-                    last_active[fd] = 0;
-                } 
-                else if (bytes < 0) 
-                {                 // 【新增】出事先验明正身，不再一律当走了
-                    if (errno == EINTR) continue;       // 闹钟路过，客人还在
-                    printf("客人 %d 出状况（errno=%d），收桌\n", fd, errno);
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                    close(fd);
-                    last_active[fd] = 0;
-                } 
-                else 
-                {
-                    buf[bytes] = 0;
-                    char method[16], path[256];
-                    int cnt = sscanf(buf, "%15s %255s", method, path);
-                    if (cnt == 2) 
-                    {
-                        bool keep_alive = (strstr(buf, "Connection: close") == nullptr);
-                        printf("客人 %d 点单：%s %s\n", fd, method, path);
-                        handle_request(fd, method, path, keep_alive);
-                        last_active[fd] = time(nullptr);   // 点单续命
-                    } 
-                    else 
-                    {
-                        char out[1024];
-                        int len = make_response(out, "400 Bad Request", "<h1>400 听不懂你在说什么</h1>", false);
-                        write(fd, out, len);
-                        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
-                        close(fd);
-                        last_active[fd] = 0;
-                    }
-                }
+                if (last_active[fd] == 0) continue;
+                Task t;
+                t.func = [fd] { do_read(fd); };   // 派单给厨师
+                threadpool_add(g_pool, t);
             }
         }
     }
 
-
-    // ===== 优雅打烊（新！）=====
+    threadpool_destroy(g_pool);
     close(listen_fd);
-    close(epfd);
-    printf("我的 epoll 服务器已关闭！\n");
+    close(g_epfd);
+    LOG_INFO("我的 epoll+线程池 服务器已关闭！");
     return 0;
 }
