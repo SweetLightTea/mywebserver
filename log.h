@@ -25,10 +25,10 @@ inline void log_write(const char* level, const char* fmt, ...) {
     int prefix_len = snprintf(buf, sizeof(buf), "[%s] %s ", timebuf, level);
 
     // ② 拼用户消息（vsnprintf = printf 的安全版，限定最大长度防溢出）
-    va_list ap;
+    va_list ap; //ap 就是“参数指针”，可以理解为一个游标，指向当前待处理的参数。
     va_start(ap, fmt);
-    vsnprintf(buf + prefix_len, sizeof(buf) - prefix_len, fmt, ap);
-    va_end(ap);
+    vsnprintf(buf + prefix_len, sizeof(buf) - prefix_len, fmt, ap); //sizeof(buf) - prefix_len：缓冲区剩余可用空间，防止溢出。
+    va_end(ap); //va_end 宏用于结束对可变参数的访问，执行必要的清理工作。
 
     // ③ 末尾补换行
     int len = (int)strlen(buf);
@@ -41,7 +41,8 @@ inline void log_write(const char* level, const char* fmt, ...) {
     // ④ 锁门，写文件 + 终端
     std::lock_guard<std::mutex> lock(g_log_lock);
     FILE* fp = fopen("server.log", "a");  // a = append 追加模式
-    if (fp) {
+    if (fp) 
+    {
         fputs(buf, fp);
         fclose(fp);
     }
