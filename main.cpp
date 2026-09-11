@@ -13,6 +13,7 @@
 #include <string>              // 【L21】用 std::string 当请求缓冲
 #include "log.h"               // 【L19】日志宏
 #include "threadpool.h"        // 【L17】线程池
+#include "sql_connection_pool.h" //预处理器是从上到下顺序展开的。当处理到 sql_connection_pool.h 时，LOG_INFO 这个宏已经在 log.h 里定义过了，所以编译器认识它。
 
 const int TICK_SEC    = 3;
 const int TIMEOUT_SEC = 6;
@@ -64,13 +65,23 @@ void handle_request(int fd, const char* method, const char* path, bool keep_aliv
         len = make_response(out, "200 OK", "<h1>欢迎光临首页！</h1>", keep_alive);
     else if (strcmp(path, "/hello") == 0)
         len = make_response(out, "200 OK", "<h1>你好，这里是 /hello</h1>", keep_alive);
-    else if (strcmp(path, "/time") == 0) {
+    else if (strcmp(path, "/time") == 0) 
+    {
         char tbuf[64], body[128];
         time_t t = time(nullptr);
         strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", localtime(&t));
         snprintf(body, sizeof(body), "<h1>服务器时间：%s</h1>", tbuf);
         len = make_response(out, "200 OK", body, keep_alive);
-    } else
+    } 
+    else if (strcmp(path, "/sql") == 0) 
+    {
+        std::string* conn = SqlConnPool::Instance().GetConn();
+        std::string fake_row = "使用连接 " + *conn + " 查到：用户名=alice 积分=100";
+        SqlConnPool::Instance().FreeConn(conn);
+        std::string body = "<h1>SQL Pool OK</h1><p>" + fake_row + "</p>";
+        len = make_response(out, "200 OK", body.c_str(), keep_alive);
+    }
+    else
         len = make_response(out, "404 Not Found", "<h1>404：菜单上没有这道菜</h1>", keep_alive);
     write(fd, out, len);
 }
@@ -175,6 +186,8 @@ void do_read(int fd)
 
 int main() 
 {
+    SqlConnPool::Instance().Init(8);   // L22: 启动时配 8 把钥匙
+
     signal(SIGPIPE, SIG_IGN);
     signal(SIGALRM, on_alarm);
     alarm(TICK_SEC);
@@ -271,6 +284,7 @@ int main()
     }
 
     threadpool_destroy(g_pool);
+    SqlConnPool::Instance().Close();   // L22: 关服务器时回收销毁钥匙
     close(listen_fd);
     close(g_epfd);
     LOG_INFO("我的 epoll+线程池 服务器已关闭！");
