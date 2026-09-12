@@ -55,31 +55,109 @@ int make_response(char* out, const char* status, const char* body, bool keep_ali
         body);
 }
 
-// ========== 路由（和以前一样）==========
-void handle_request(int fd, const char* method, const char* path, bool keep_alive) 
+// ========== 【L23】从请求头里找 Content-Length 的数值 ==========
+int find_content_length(const std::string& headers)
+{
+    // 请求头里长这样：Content-Length: 25   （数字前有个空格，atoi 自己会跳过）
+    const char* keys[2] = { "Content-Length:", "content-length:" };  // 大小写各试一遍
+    for (int k = 0; k < 2; k++) 
+    {
+        size_t p = headers.find(keys[k]);
+        if (p != std::string::npos) 
+            return atoi(headers.c_str() + p + strlen(keys[k]));
+    }
+    return 0;   // 头里没写 = 当 0（GET 请求就是这样）
+}
+
+// ========== 【L23】URL 解码：把 %41 还原成字母 A，把 + 还原成空格 ==========
+std::string url_decode(const std::string& s)
+{
+    // 浏览器发中文和特殊字符时会转义，比如 "张 三" -> "%E5%BC%A0+%E4%B8%89"
+    std::string out;
+    for (size_t i = 0; i < s.size(); i++) 
+    {
+        if (s[i] == '+') 
+        {
+            out += ' ';
+        } 
+        else if (s[i] == '%' && i + 2 < s.size()) 
+        {
+            char hex[3] = { s[i+1], s[i+2], 0 };           // 取 % 后面两个十六进制字符
+            out += (char)strtol(hex, nullptr, 16);          // "41" -> 0x41 -> 字母 A
+            i += 2;
+        } 
+        else 
+        {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+// ========== 路由（【L23】多接一个 body 参数 + POST 路由）==========
+void handle_request(int fd, const char* method, const char* path, const std::string& body, bool keep_alive)
 {
     char out[8192]; int len;
-    if (strcmp(method, "GET") != 0)
-        len = make_response(out, "405 Method Not Allowed", "<h1>405 我只听得懂 GET</h1>", keep_alive);
+
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/echo") == 0)
+    {
+        // 【L23】拆 form-urlencoded：username=alice&passwd=123
+        // 规则：& 分隔每对键值，= 分隔键和值
+        std::string page = "<h1>收到 POST，拆出来的键值：</h1>"
+                           "<table border='1'><tr><th>键</th><th>值</th></tr>";
+        size_t start = 0;
+        while (start < body.size()) 
+        {
+            size_t amp = body.find('&', start);              // 找下一对键值的起点
+            if (amp == std::string::npos) amp = body.size();
+            if (amp > start) 
+            {
+                std::string kv = body.substr(start, amp - start);
+                size_t eq = kv.find('=');                    // 键和值的分界
+                std::string k = (eq == std::string::npos) ? kv : kv.substr(0, eq);
+                std::string v = (eq == std::string::npos) ? "" : kv.substr(eq + 1);
+                page += "<tr><td>" + url_decode(k) + "</td><td>" + url_decode(v) + "</td></tr>";
+            }
+            start = amp + 1;
+        }
+        page += "</table>";
+        len = make_response(out, "200 OK", page.c_str(), keep_alive);
+        LOG_INFO("【L23】POST /echo 处理完毕，身子 %zu 字节", body.size());
+    }
+    else if (strcmp(method, "GET") != 0)
+        len = make_response(out, "405 Method Not Allowed", "<h1>405 我听得懂 GET 和 POST /echo</h1>", keep_alive);
     else if (strcmp(path, "/") == 0)
         len = make_response(out, "200 OK", "<h1>欢迎光临首页！</h1>", keep_alive);
     else if (strcmp(path, "/hello") == 0)
         len = make_response(out, "200 OK", "<h1>你好，这里是 /hello</h1>", keep_alive);
-    else if (strcmp(path, "/time") == 0) 
+    else if (strcmp(path, "/time") == 0)
     {
-        char tbuf[64], body[128];
+        char tbuf[64], body2[128];
         time_t t = time(nullptr);
         strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", localtime(&t));
-        snprintf(body, sizeof(body), "<h1>服务器时间：%s</h1>", tbuf);
-        len = make_response(out, "200 OK", body, keep_alive);
-    } 
-    else if (strcmp(path, "/sql") == 0) 
+        snprintf(body2, sizeof(body2), "<h1>服务器时间：%s</h1>", tbuf);
+        len = make_response(out, "200 OK", body2, keep_alive);
+    }
+    else if (strcmp(path, "/sql") == 0)
     {
         std::string* conn = SqlConnPool::Instance().GetConn();
         std::string fake_row = "使用连接 " + *conn + " 查到：用户名=alice 积分=100";
         SqlConnPool::Instance().FreeConn(conn);
-        std::string body = "<h1>SQL Pool OK</h1><p>" + fake_row + "</p>";
-        len = make_response(out, "200 OK", body.c_str(), keep_alive);
+        std::string b = "<h1>SQL Pool OK</h1><p>" + fake_row + "</p>";
+        len = make_response(out, "200 OK", b.c_str(), keep_alive);
+    }
+    else if (strcmp(path, "/post") == 0)
+    {
+        // 【L23】浏览器测试页：填完表单点提交，浏览器会自动 POST 到 /echo
+        // 注意 HTML 属性用单引号 ' —— 跟 C 字符串的双引号 " 打架时会报编译错
+        std::string form =
+            "<h1>POST 测试表单</h1>"
+            "<form method='POST' action='/echo'>"
+            "用户名：<input name='username'><br>"
+            "密码：<input name='passwd' type='password'><br>"
+            "<button type='submit'>提交</button>"
+            "</form>";
+        len = make_response(out, "200 OK", form.c_str(), keep_alive);
     }
     else
         len = make_response(out, "404 Not Found", "<h1>404：菜单上没有这道菜</h1>", keep_alive);
@@ -112,52 +190,63 @@ void send_error_and_close(int fd, const char* status, const char* body)
 }
 
 // ========== 【L21 大改】厨师干活：先攒够，再切分 ==========
-void do_read(int fd) 
+// ========== 厨师干活：先攒够，再切分（【L23】POST 的身子也要攒齐）==========
+void do_read(int fd)
 {
     char buf[4096];
 
-    // ----- 阶段一：能读多少读多少，全塞进便签（不解析！）-----
-    while (true) 
+    // ----- 阶段一：能读多少读多少，全塞进便签（不解析！）-----（原样不动）
+    while (true)
     {
         int bytes = read(fd, buf, sizeof(buf));
-
-        if (bytes == 0) {                       // 客人礼貌告别
-            LOG_INFO("客人 %d 走了", fd);
-            close_conn(fd);
-            return;
-        }
-        if (bytes < 0) 
+        if (bytes == 0) { LOG_INFO("客人 %d 走了", fd); close_conn(fd); return; }
+        if (bytes < 0)
         {
-            if (errno == EINTR) continue;        // 闹钟路过，重读
-            if (errno == EAGAIN) break;          // 读干了 → 去切请求
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN) break;
             LOG_WARN("客人 %d 出状况（errno=%d），收桌", fd, errno);
             close_conn(fd);
             return;
         }
-
-        g_conns[fd].inbuf.append(buf, bytes);    // 【关键】先攒着，别急着解析
-
-        if (g_conns[fd].inbuf.size() > MAX_REQ_BUF) 
-        {   // 【L21】防赖皮客人
+        g_conns[fd].inbuf.append(buf, bytes);
+        if (g_conns[fd].inbuf.size() > MAX_REQ_BUF)
+        {
             LOG_WARN("客人 %d 请求超长（%zu 字节），收桌", fd, g_conns[fd].inbuf.size());
             send_error_and_close(fd, "413 Payload Too Large", "<h1>413 你这单子太长了</h1>");
             return;
         }
     }
 
-    // ----- 阶段二：从便签里按 \r\n\r\n 切完整请求（可能一次切出好几条）-----
-    while (true) 
+    // ----- 阶段二：【L23 改这里】头齐 + 身子齐，缺一不可 -----
+    while (true)
     {
         std::string& inb = g_conns[fd].inbuf;
-        size_t pos = inb.find("\r\n\r\n");       // 找"空行" = 请求头结束
-        if (pos == std::string::npos) break;     // 半包：还没凑齐，等下一批数据
+        size_t pos = inb.find("\r\n\r\n");           // 找"空行" = 头结束
+        if (pos == std::string::npos) break;         // 头都没齐，等下一批
 
-        std::string req = inb.substr(0, pos + 4);   // 切出一条完整请求（含末尾 \r\n\r\n）
-        inb.erase(0, pos + 4);                      // 从便签上划掉，剩下的留给下一轮
+        std::string headers = inb.substr(0, pos);    // 头部全文（不含空行）
+        int clen = find_content_length(headers);     // 【L23】身子有多长？
+
+        if (clen < 0)
+        {   // 【L23】赖皮客人报负数 —— 不防的话 substr 会拿负数当巨大无符号数，直接崩
+            LOG_WARN("客人 %d 的 Content-Length 是负数（%d），收桌", fd, clen);
+            send_error_and_close(fd, "400 Bad Request", "<h1>400 别报假数</h1>");
+            return;
+        }
+
+        if (inb.size() < pos + 4 + (size_t)clen)
+        {   // 【L23 核心】头齐了但身子没到齐 → 半包，留在便签上接着等
+            LOG_INFO("客人 %d 的身子还差 %zu 字节，接着等", fd, pos + 4 + (size_t)clen - inb.size());
+            break;
+        }
+
+        std::string req  = inb.substr(0, pos + 4);               // 头（含空行）
+        std::string body = inb.substr(pos + 4, (size_t)clen);     // 【L23】身子切出来
+        inb.erase(0, pos + 4 + (size_t)clen);                     // 划掉整条：头+空行+身子
 
         char method[16] = {0}, path[256] = {0};
         int cnt = sscanf(req.c_str(), "%15s %255s", method, path);
-        if (cnt != 2) 
+        if (cnt != 2)
         {
             LOG_WARN("客人 %d 请求格式看不懂，收桌", fd);
             send_error_and_close(fd, "400 Bad Request", "<h1>400 听不懂你在说什么</h1>");
@@ -165,19 +254,19 @@ void do_read(int fd)
         }
 
         bool keep_alive = (req.find("Connection: close") == std::string::npos);
-        LOG_INFO("厨师做菜：客人 %d 点 %s %s", fd, method, path);
-        handle_request(fd, method, path, keep_alive);
+        LOG_INFO("厨师做菜：客人 %d 点 %s %s（身子 %d 字节）", fd, method, path, clen);
+        handle_request(fd, method, path, body, keep_alive);        // 【L23】多传一个 body
         last_active[fd] = time(nullptr);
 
-        if (!keep_alive) 
-        {                       // 【L21】客人说要走，服务端别赖着
+        if (!keep_alive)
+        {
             LOG_INFO("客人 %d 说了 close，收桌", fd);
             close_conn(fd);
             return;
         }
     }
 
-    // ----- 阶段三：挂回（哪怕一条完整请求都没切出来，也必须挂回！）-----
+    // ----- 阶段三：挂回（哪怕什么都没切出来也必须挂回！）-----（原样不动）
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
     ev.data.fd = fd;
