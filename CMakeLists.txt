@@ -3,3 +3,4 @@ project(mywebserver)
 set(CMAKE_CXX_STANDARD 17)
 add_executable(mywebserver main.cpp)
 target_link_libraries(mywebserver pthread)    # 新增：链 pthread库
+target_link_libraries(mywebserver pthread mysqlclient)    # L24: 多链一个 mysqlclient 库

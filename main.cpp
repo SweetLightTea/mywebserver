@@ -11,6 +11,7 @@
 #include <cerrno>
 #include <mutex>
 #include <string>              // 【L21】用 std::string 当请求缓冲
+#include <map>                 // 【L24】装表单拆出来的键值对
 #include "log.h"               // 【L19】日志宏
 #include "threadpool.h"        // 【L17】线程池
 #include "sql_connection_pool.h" //预处理器是从上到下顺序展开的。当处理到 sql_connection_pool.h 时，LOG_INFO 这个宏已经在 log.h 里定义过了，所以编译器认识它。
@@ -94,6 +95,27 @@ std::string url_decode(const std::string& s)
     return out;
 }
 
+// ========== 【L24】把 form-urlencoded 拆成键值对，塞进 map ==========
+// 键和值都过一遍 url_decode（浏览器发的中文是 %E5%BC%A0 这种转义形态）
+void parse_form(const std::string& body, std::map<std::string, std::string>& out)
+{
+    size_t start = 0;
+    while (start < body.size())
+    {
+        size_t amp = body.find('&', start);              // & 分隔每对键值
+        if (amp == std::string::npos) amp = body.size();
+        if (amp > start)
+        {
+            std::string kv = body.substr(start, amp - start);
+            size_t eq = kv.find('=');                    // = 分隔键和值
+            std::string k = (eq == std::string::npos) ? kv : kv.substr(0, eq);
+            std::string v = (eq == std::string::npos) ? "" : kv.substr(eq + 1);
+            out[url_decode(k)] = url_decode(v);
+        }
+        start = amp + 1;
+    }
+}
+
 // ========== 路由（【L23】多接一个 body 参数 + POST 路由）==========
 void handle_request(int fd, const char* method, const char* path, const std::string& body, bool keep_alive)
 {
@@ -124,6 +146,95 @@ void handle_request(int fd, const char* method, const char* path, const std::str
         len = make_response(out, "200 OK", page.c_str(), keep_alive);
         LOG_INFO("【L23】POST /echo 处理完毕，身子 %zu 字节", body.size());
     }
+    else if (strcmp(method, "POST") == 0 && strcmp(path, "/register") == 0)
+    {
+        // 【L24】注册：先查有没有重名，没有就插进 user 表
+        std::map<std::string, std::string> form;
+        parse_form(body, form);
+        std::string user = form.count("username") ? form["username"] : "";
+        std::string pass = form.count("passwd") ? form["passwd"] : "";
+        if (user.empty() || pass.empty())
+            len = make_response(out, "400 Bad Request", "<h1>400 用户名和密码都得填</h1>", keep_alive);
+        else
+        {
+            if (user.size() > 50) user.resize(50);   // 表里就 CHAR(50)，超长先剪
+            if (pass.size() > 50) pass.resize(50);
+
+            MYSQL* conn = SqlConnPool::Instance().GetConn();
+            // 防注入核心：用户输入不能直接拼 SQL，先把 ' 引号等危险字符转义掉
+            char eu[101] = {0}, ep[101] = {0};
+            mysql_real_escape_string(conn, eu, user.c_str(), user.size());
+            mysql_real_escape_string(conn, ep, pass.c_str(), pass.size());
+
+            char sql[512];
+            snprintf(sql, sizeof(sql), "SELECT passwd FROM user WHERE username='%s'", eu);
+            std::string msg;
+            if (mysql_query(conn, sql) != 0)
+                msg = std::string("<h1>500 数据库出错</h1><p>") + mysql_error(conn) + "</p>";
+            else
+            {
+                MYSQL_RES* res = mysql_store_result(conn);
+                if (mysql_fetch_row(res))          // 查到行 = 这名字有人用了
+                    msg = "<h1>注册失败：用户名 " + user + " 已经有人用了</h1>";
+                else
+                {
+                    snprintf(sql, sizeof(sql),
+                             "INSERT INTO user(username, passwd) VALUES('%s', '%s')", eu, ep);
+                    if (mysql_query(conn, sql) == 0)
+                    {
+                        msg = "<h1>注册成功！</h1><p>用户名：" + user + "</p><p><a href='/user'>去登录</a></p>";
+                        LOG_INFO("【L24】注册成功：%s", user.c_str());
+                    }
+                    else
+                        msg = std::string("<h1>500 插入出错</h1><p>") + mysql_error(conn) + "</p>";
+                }
+                mysql_free_result(res);
+            }
+            SqlConnPool::Instance().FreeConn(conn);
+            len = make_response(out, "200 OK", msg.c_str(), keep_alive);
+        }
+    }
+    else if (strcmp(method, "POST") == 0 && strcmp(path, "/login") == 0)
+    {
+        // 【L24】登录：按用户名查密码，跟表单里密码对
+        std::map<std::string, std::string> form;
+        parse_form(body, form);
+        std::string user = form.count("username") ? form["username"] : "";
+        std::string pass = form.count("passwd") ? form["passwd"] : "";
+        if (user.empty() || pass.empty())
+            len = make_response(out, "400 Bad Request", "<h1>400 用户名和密码都得填</h1>", keep_alive);
+        else
+        {
+            if (user.size() > 50) user.resize(50);
+
+            MYSQL* conn = SqlConnPool::Instance().GetConn();
+            char eu[101] = {0};
+            mysql_real_escape_string(conn, eu, user.c_str(), user.size());
+            char sql[512];
+            snprintf(sql, sizeof(sql), "SELECT passwd FROM user WHERE username='%s'", eu);
+
+            std::string msg;
+            if (mysql_query(conn, sql) != 0)
+                msg = std::string("<h1>500 数据库出错</h1><p>") + mysql_error(conn) + "</p>";
+            else
+            {
+                MYSQL_RES* res = mysql_store_result(conn);
+                MYSQL_ROW row = mysql_fetch_row(res);
+                if (!row)
+                    msg = "<h1>登录失败：查无此人 " + user + "</h1>";
+                else if (pass == row[0])   // row[0] 是库里存的密码（教学版明文，生产得加密！）
+                {
+                    msg = "<h1>登录成功！欢迎回来，" + user + "</h1>";
+                    LOG_INFO("【L24】登录成功：%s", user.c_str());
+                }
+                else
+                    msg = "<h1>登录失败：密码不对</h1>";
+                mysql_free_result(res);
+            }
+            SqlConnPool::Instance().FreeConn(conn);
+            len = make_response(out, "200 OK", msg.c_str(), keep_alive);
+        }
+    }
     else if (strcmp(method, "GET") != 0)
         len = make_response(out, "405 Method Not Allowed", "<h1>405 我听得懂 GET 和 POST /echo</h1>", keep_alive);
     else if (strcmp(path, "/") == 0)
@@ -140,11 +251,20 @@ void handle_request(int fd, const char* method, const char* path, const std::str
     }
     else if (strcmp(path, "/sql") == 0)
     {
-        std::string* conn = SqlConnPool::Instance().GetConn();
-        std::string fake_row = "使用连接 " + *conn + " 查到：用户名=alice 积分=100";
+        // 【L24】真去数据库数一数 user 表里有几个人
+        MYSQL* conn = SqlConnPool::Instance().GetConn();
+        std::string msg;
+        if (mysql_query(conn, "SELECT COUNT(*) FROM user") == 0)
+        {
+            MYSQL_RES* res = mysql_store_result(conn);   // 把查询结果抱回家
+            MYSQL_ROW row = mysql_fetch_row(res);        // row[0] 就是人数（字符串形态）
+            msg = "<h1>SQL Pool OK（真连接）</h1><p>user 表里现有 " + std::string(row[0]) + " 个用户</p>";
+            mysql_free_result(res);                      // 结果用完必须还，不然内存漏
+        }
+        else
+            msg = std::string("<h1>500 查询失败</h1><p>") + mysql_error(conn) + "</p>";
         SqlConnPool::Instance().FreeConn(conn);
-        std::string b = "<h1>SQL Pool OK</h1><p>" + fake_row + "</p>";
-        len = make_response(out, "200 OK", b.c_str(), keep_alive);
+        len = make_response(out, "200 OK", msg.c_str(), keep_alive);
     }
     else if (strcmp(path, "/post") == 0)
     {
@@ -159,6 +279,26 @@ void handle_request(int fd, const char* method, const char* path, const std::str
             "</form>";
         len = make_response(out, "200 OK", form.c_str(), keep_alive);
     }
+    else if (strcmp(path, "/user") == 0)
+    {
+        // 【L24】注册登录双表单测试页（HTML 属性用单引号 ' ，别用双引号——跟 C 字符串打架）
+        std::string page =
+            "<h1>用户系统测试页</h1>"
+            "<h2>注册</h2>"
+            "<form method='POST' action='/register'>"
+            "用户名：<input name='username'><br>"
+            "密码：<input name='passwd' type='password'><br>"
+            "<button type='submit'>注册</button>"
+            "</form>"
+            "<h2>登录</h2>"
+            "<form method='POST' action='/login'>"
+            "用户名：<input name='username'><br>"
+            "密码：<input name='passwd' type='password'><br>"
+            "<button type='submit'>登录</button>"
+            "</form>";
+        len = make_response(out, "200 OK", page.c_str(), keep_alive);
+    }
+
     else
         len = make_response(out, "404 Not Found", "<h1>404：菜单上没有这道菜</h1>", keep_alive);
     write(fd, out, len);
@@ -275,7 +415,7 @@ void do_read(int fd)
 
 int main() 
 {
-    SqlConnPool::Instance().Init(8);   // L22: 启动时配 8 把钥匙
+    SqlConnPool::Instance().Init("localhost", "web", "web123456", "tinywebdb", 8);   // 【L24】8 把真钥匙
 
     signal(SIGPIPE, SIG_IGN);
     signal(SIGALRM, on_alarm);
