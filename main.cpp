@@ -31,6 +31,8 @@ void on_signal(int) { g_stop = 1; }
 time_t last_active[1024] = {0};
 ThreadPool* g_pool = nullptr;
 int g_epfd = -1;
+int g_actor = 1;    // 【L25】模式开关：0 = Reactor（厨师全包），1 = Proactor（主线程管读，厨师纯做菜）
+                    // 先写死变量，L29 学 config 时换成命令行参数 -a
 
 std::mutex g_log_lock;    // log.h 里 extern 声明的锁，本体在这
 
@@ -41,19 +43,19 @@ struct ConnCtx
 };
 ConnCtx g_conns[1024];
 
-// ========== 响应工厂（和以前一样）==========
-int make_response(char* out, const char* status, const char* body, bool keep_alive) 
+// ========== 响应工厂（【L25】升级：返回 std::string，不再受栈缓冲 8K 上限）==========
+std::string make_response_str(const char* status, const char* body, bool keep_alive)
 {
-    return sprintf(out,
+    char head[256];
+    int hl = snprintf(head, sizeof(head),
         "HTTP/1.1 %s\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n"
-        "\r\n"
-        "%s",
+        "\r\n",
         status, strlen(body),
-        keep_alive ? "keep-alive" : "close",
-        body);
+        keep_alive ? "keep-alive" : "close");
+    return std::string(head, hl) + body;    // 头（精确长度）拼接身子
 }
 
 // ========== 【L23】从请求头里找 Content-Length 的数值 ==========
@@ -116,26 +118,22 @@ void parse_form(const std::string& body, std::map<std::string, std::string>& out
     }
 }
 
-// ========== 路由（【L23】多接一个 body 参数 + POST 路由）==========
-void handle_request(int fd, const char* method, const char* path, const std::string& body, bool keep_alive)
+// ========== 路由（【L25】只做菜不上菜：返回响应字符串，write 移出去）==========
+std::string handle_request(const char* method, const char* path, const std::string& body, bool keep_alive)
 {
-    char out[8192]; int len;
-
     if (strcmp(method, "POST") == 0 && strcmp(path, "/echo") == 0)
     {
-        // 【L23】拆 form-urlencoded：username=alice&passwd=123
-        // 规则：& 分隔每对键值，= 分隔键和值
         std::string page = "<h1>收到 POST，拆出来的键值：</h1>"
                            "<table border='1'><tr><th>键</th><th>值</th></tr>";
         size_t start = 0;
-        while (start < body.size()) 
+        while (start < body.size())
         {
-            size_t amp = body.find('&', start);              // 找下一对键值的起点
+            size_t amp = body.find('&', start);
             if (amp == std::string::npos) amp = body.size();
-            if (amp > start) 
+            if (amp > start)
             {
                 std::string kv = body.substr(start, amp - start);
-                size_t eq = kv.find('=');                    // 键和值的分界
+                size_t eq = kv.find('=');
                 std::string k = (eq == std::string::npos) ? kv : kv.substr(0, eq);
                 std::string v = (eq == std::string::npos) ? "" : kv.substr(eq + 1);
                 page += "<tr><td>" + url_decode(k) + "</td><td>" + url_decode(v) + "</td></tr>";
@@ -143,133 +141,121 @@ void handle_request(int fd, const char* method, const char* path, const std::str
             start = amp + 1;
         }
         page += "</table>";
-        len = make_response(out, "200 OK", page.c_str(), keep_alive);
         LOG_INFO("【L23】POST /echo 处理完毕，身子 %zu 字节", body.size());
+        return make_response_str("200 OK", page.c_str(), keep_alive);
     }
     else if (strcmp(method, "POST") == 0 && strcmp(path, "/register") == 0)
     {
-        // 【L24】注册：先查有没有重名，没有就插进 user 表
         std::map<std::string, std::string> form;
         parse_form(body, form);
         std::string user = form.count("username") ? form["username"] : "";
         std::string pass = form.count("passwd") ? form["passwd"] : "";
         if (user.empty() || pass.empty())
-            len = make_response(out, "400 Bad Request", "<h1>400 用户名和密码都得填</h1>", keep_alive);
+            return make_response_str("400 Bad Request", "<h1>400 用户名和密码都得填</h1>", keep_alive);
+        if (user.size() > 50) user.resize(50);
+        if (pass.size() > 50) pass.resize(50);
+
+        MYSQL* conn = SqlConnPool::Instance().GetConn();
+        char eu[101] = {0}, ep[101] = {0};
+        mysql_real_escape_string(conn, eu, user.c_str(), user.size());
+        mysql_real_escape_string(conn, ep, pass.c_str(), pass.size());
+
+        char sql[512];
+        snprintf(sql, sizeof(sql), "SELECT passwd FROM user WHERE username='%s'", eu);
+        std::string msg;
+        if (mysql_query(conn, sql) != 0)
+            msg = std::string("<h1>500 数据库出错</h1><p>") + mysql_error(conn) + "</p>";
         else
         {
-            if (user.size() > 50) user.resize(50);   // 表里就 CHAR(50)，超长先剪
-            if (pass.size() > 50) pass.resize(50);
-
-            MYSQL* conn = SqlConnPool::Instance().GetConn();
-            // 防注入核心：用户输入不能直接拼 SQL，先把 ' 引号等危险字符转义掉
-            char eu[101] = {0}, ep[101] = {0};
-            mysql_real_escape_string(conn, eu, user.c_str(), user.size());
-            mysql_real_escape_string(conn, ep, pass.c_str(), pass.size());
-
-            char sql[512];
-            snprintf(sql, sizeof(sql), "SELECT passwd FROM user WHERE username='%s'", eu);
-            std::string msg;
-            if (mysql_query(conn, sql) != 0)
-                msg = std::string("<h1>500 数据库出错</h1><p>") + mysql_error(conn) + "</p>";
+            MYSQL_RES* res = mysql_store_result(conn);
+            if (mysql_fetch_row(res))
+                msg = "<h1>注册失败：用户名 " + user + " 已经有人用了</h1>";
             else
             {
-                MYSQL_RES* res = mysql_store_result(conn);
-                if (mysql_fetch_row(res))          // 查到行 = 这名字有人用了
-                    msg = "<h1>注册失败：用户名 " + user + " 已经有人用了</h1>";
-                else
+                snprintf(sql, sizeof(sql),
+                         "INSERT INTO user(username, passwd) VALUES('%s', '%s')", eu, ep);
+                if (mysql_query(conn, sql) == 0)
                 {
-                    snprintf(sql, sizeof(sql),
-                             "INSERT INTO user(username, passwd) VALUES('%s', '%s')", eu, ep);
-                    if (mysql_query(conn, sql) == 0)
-                    {
-                        msg = "<h1>注册成功！</h1><p>用户名：" + user + "</p><p><a href='/user'>去登录</a></p>";
-                        LOG_INFO("【L24】注册成功：%s", user.c_str());
-                    }
-                    else
-                        msg = std::string("<h1>500 插入出错</h1><p>") + mysql_error(conn) + "</p>";
+                    msg = "<h1>注册成功！</h1><p>用户名：" + user + "</p><p><a href='/user'>去登录</a></p>";
+                    LOG_INFO("【L24】注册成功：%s", user.c_str());
                 }
-                mysql_free_result(res);
+                else
+                    msg = std::string("<h1>500 插入出错</h1><p>") + mysql_error(conn) + "</p>";
             }
-            SqlConnPool::Instance().FreeConn(conn);
-            len = make_response(out, "200 OK", msg.c_str(), keep_alive);
+            mysql_free_result(res);
         }
+        SqlConnPool::Instance().FreeConn(conn);
+        return make_response_str("200 OK", msg.c_str(), keep_alive);
     }
     else if (strcmp(method, "POST") == 0 && strcmp(path, "/login") == 0)
     {
-        // 【L24】登录：按用户名查密码，跟表单里密码对
         std::map<std::string, std::string> form;
         parse_form(body, form);
         std::string user = form.count("username") ? form["username"] : "";
         std::string pass = form.count("passwd") ? form["passwd"] : "";
         if (user.empty() || pass.empty())
-            len = make_response(out, "400 Bad Request", "<h1>400 用户名和密码都得填</h1>", keep_alive);
+            return make_response_str("400 Bad Request", "<h1>400 用户名和密码都得填</h1>", keep_alive);
+        if (user.size() > 50) user.resize(50);
+
+        MYSQL* conn = SqlConnPool::Instance().GetConn();
+        char eu[101] = {0};
+        mysql_real_escape_string(conn, eu, user.c_str(), user.size());
+        char sql[512];
+        snprintf(sql, sizeof(sql), "SELECT passwd FROM user WHERE username='%s'", eu);
+
+        std::string msg;
+        if (mysql_query(conn, sql) != 0)
+            msg = std::string("<h1>500 数据库出错</h1><p>") + mysql_error(conn) + "</p>";
         else
         {
-            if (user.size() > 50) user.resize(50);
-
-            MYSQL* conn = SqlConnPool::Instance().GetConn();
-            char eu[101] = {0};
-            mysql_real_escape_string(conn, eu, user.c_str(), user.size());
-            char sql[512];
-            snprintf(sql, sizeof(sql), "SELECT passwd FROM user WHERE username='%s'", eu);
-
-            std::string msg;
-            if (mysql_query(conn, sql) != 0)
-                msg = std::string("<h1>500 数据库出错</h1><p>") + mysql_error(conn) + "</p>";
-            else
+            MYSQL_RES* res = mysql_store_result(conn);
+            MYSQL_ROW row = mysql_fetch_row(res);
+            if (!row)
+                msg = "<h1>登录失败：查无此人 " + user + "</h1>";
+            else if (pass == row[0])
             {
-                MYSQL_RES* res = mysql_store_result(conn);
-                MYSQL_ROW row = mysql_fetch_row(res);
-                if (!row)
-                    msg = "<h1>登录失败：查无此人 " + user + "</h1>";
-                else if (pass == row[0])   // row[0] 是库里存的密码（教学版明文，生产得加密！）
-                {
-                    msg = "<h1>登录成功！欢迎回来，" + user + "</h1>";
-                    LOG_INFO("【L24】登录成功：%s", user.c_str());
-                }
-                else
-                    msg = "<h1>登录失败：密码不对</h1>";
-                mysql_free_result(res);
+                msg = "<h1>登录成功！欢迎回来，" + user + "</h1>";
+                LOG_INFO("【L24】登录成功：%s", user.c_str());
             }
-            SqlConnPool::Instance().FreeConn(conn);
-            len = make_response(out, "200 OK", msg.c_str(), keep_alive);
+            else
+                msg = "<h1>登录失败：密码不对</h1>";
+            mysql_free_result(res);
         }
+        SqlConnPool::Instance().FreeConn(conn);
+        return make_response_str("200 OK", msg.c_str(), keep_alive);
     }
     else if (strcmp(method, "GET") != 0)
-        len = make_response(out, "405 Method Not Allowed", "<h1>405 我听得懂 GET 和 POST /echo</h1>", keep_alive);
+        return make_response_str("405 Method Not Allowed", "<h1>405 我听得懂 GET 和 POST /echo</h1>", keep_alive);
     else if (strcmp(path, "/") == 0)
-        len = make_response(out, "200 OK", "<h1>欢迎光临首页！</h1>", keep_alive);
+        return make_response_str("200 OK", "<h1>欢迎光临首页！</h1>", keep_alive);
     else if (strcmp(path, "/hello") == 0)
-        len = make_response(out, "200 OK", "<h1>你好，这里是 /hello</h1>", keep_alive);
+        return make_response_str("200 OK", "<h1>你好，这里是 /hello</h1>", keep_alive);
     else if (strcmp(path, "/time") == 0)
     {
         char tbuf[64], body2[128];
         time_t t = time(nullptr);
         strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", localtime(&t));
         snprintf(body2, sizeof(body2), "<h1>服务器时间：%s</h1>", tbuf);
-        len = make_response(out, "200 OK", body2, keep_alive);
+        return make_response_str("200 OK", body2, keep_alive);
     }
     else if (strcmp(path, "/sql") == 0)
     {
-        // 【L24】真去数据库数一数 user 表里有几个人
         MYSQL* conn = SqlConnPool::Instance().GetConn();
         std::string msg;
         if (mysql_query(conn, "SELECT COUNT(*) FROM user") == 0)
         {
-            MYSQL_RES* res = mysql_store_result(conn);   // 把查询结果抱回家
-            MYSQL_ROW row = mysql_fetch_row(res);        // row[0] 就是人数（字符串形态）
+            MYSQL_RES* res = mysql_store_result(conn);
+            MYSQL_ROW row = mysql_fetch_row(res);
             msg = "<h1>SQL Pool OK（真连接）</h1><p>user 表里现有 " + std::string(row[0]) + " 个用户</p>";
-            mysql_free_result(res);                      // 结果用完必须还，不然内存漏
+            mysql_free_result(res);
         }
         else
             msg = std::string("<h1>500 查询失败</h1><p>") + mysql_error(conn) + "</p>";
         SqlConnPool::Instance().FreeConn(conn);
-        len = make_response(out, "200 OK", msg.c_str(), keep_alive);
+        return make_response_str("200 OK", msg.c_str(), keep_alive);
     }
     else if (strcmp(path, "/post") == 0)
     {
-        // 【L23】浏览器测试页：填完表单点提交，浏览器会自动 POST 到 /echo
-        // 注意 HTML 属性用单引号 ' —— 跟 C 字符串的双引号 " 打架时会报编译错
         std::string form =
             "<h1>POST 测试表单</h1>"
             "<form method='POST' action='/echo'>"
@@ -277,11 +263,10 @@ void handle_request(int fd, const char* method, const char* path, const std::str
             "密码：<input name='passwd' type='password'><br>"
             "<button type='submit'>提交</button>"
             "</form>";
-        len = make_response(out, "200 OK", form.c_str(), keep_alive);
+        return make_response_str("200 OK", form.c_str(), keep_alive);
     }
     else if (strcmp(path, "/user") == 0)
     {
-        // 【L24】注册登录双表单测试页（HTML 属性用单引号 ' ，别用双引号——跟 C 字符串打架）
         std::string page =
             "<h1>用户系统测试页</h1>"
             "<h2>注册</h2>"
@@ -296,12 +281,10 @@ void handle_request(int fd, const char* method, const char* path, const std::str
             "密码：<input name='passwd' type='password'><br>"
             "<button type='submit'>登录</button>"
             "</form>";
-        len = make_response(out, "200 OK", page.c_str(), keep_alive);
+        return make_response_str("200 OK", page.c_str(), keep_alive);
     }
-
     else
-        len = make_response(out, "404 Not Found", "<h1>404：菜单上没有这道菜</h1>", keep_alive);
-    write(fd, out, len);
+        return make_response_str("404 Not Found", "<h1>404：菜单上没有这道菜</h1>", keep_alive);
 }
 
 // ========== 把 fd 切成非阻塞（L20）==========
@@ -321,68 +304,74 @@ void close_conn(int fd)
 }
 
 // ========== 【L21】发个错误响应再收桌 ==========
-void send_error_and_close(int fd, const char* status, const char* body) 
+// ========== 【L21】发个错误响应再收桌（【L25】顺手摆脱 1024 栈缓冲）==========
+void send_error_and_close(int fd, const char* status, const char* body)
 {
-    char out[1024];
-    int len = make_response(out, status, body, false);
-    write(fd, out, len);
+    std::string resp = make_response_str(status, body, false);
+    write(fd, resp.data(), resp.size());
     close_conn(fd);
 }
 
-// ========== 【L21 大改】厨师干活：先攒够，再切分 ==========
-// ========== 厨师干活：先攒够，再切分（【L23】POST 的身子也要攒齐）==========
-void do_read(int fd)
+// ========== 【L25】阶段一单独抽出来：纯搬运（读 socket -> 便签）==========
+// 谁调用它，谁就是"做 IO 读的人"——Reactor 里是厨师，Proactor 里是主线程
+// 返回 false = 桌子已经收了（close_conn 已发生），调用方别再碰这个 fd
+bool fetch_request(int fd)
 {
     char buf[4096];
-
-    // ----- 阶段一：能读多少读多少，全塞进便签（不解析！）-----（原样不动）
     while (true)
     {
         int bytes = read(fd, buf, sizeof(buf));
-        if (bytes == 0) { LOG_INFO("客人 %d 走了", fd); close_conn(fd); return; }
+        if (bytes == 0) { LOG_INFO("客人 %d 走了", fd); close_conn(fd); return false; }
         if (bytes < 0)
         {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN) break;
+            if (errno == EAGAIN) break;      // 读干净了
             LOG_WARN("客人 %d 出状况（errno=%d），收桌", fd, errno);
             close_conn(fd);
-            return;
+            return false;
         }
         g_conns[fd].inbuf.append(buf, bytes);
         if (g_conns[fd].inbuf.size() > MAX_REQ_BUF)
         {
             LOG_WARN("客人 %d 请求超长（%zu 字节），收桌", fd, g_conns[fd].inbuf.size());
             send_error_and_close(fd, "413 Payload Too Large", "<h1>413 你这单子太长了</h1>");
-            return;
+            return false;
         }
     }
+    if (!g_conns[fd].inbuf.empty())
+        LOG_INFO("【L25】%s 替客人 %d 把 %zu 字节读进便签了",
+                 g_actor ? "主线程(Proactor)" : "厨师(Reactor)", fd, g_conns[fd].inbuf.size());
+    return true;    // 读完了，数据在便签上
+}
 
-    // ----- 阶段二：【L23 改这里】头齐 + 身子齐，缺一不可 -----
+// ========== 【L25】阶段二 + 上菜：纯做菜（切请求 -> 路由 -> write），一字不读 ==========
+void do_logic(int fd)
+{
     while (true)
     {
         std::string& inb = g_conns[fd].inbuf;
-        size_t pos = inb.find("\r\n\r\n");           // 找"空行" = 头结束
-        if (pos == std::string::npos) break;         // 头都没齐，等下一批
+        size_t pos = inb.find("\r\n\r\n");
+        if (pos == std::string::npos) break;
 
-        std::string headers = inb.substr(0, pos);    // 头部全文（不含空行）
-        int clen = find_content_length(headers);     // 【L23】身子有多长？
+        std::string headers = inb.substr(0, pos);
+        int clen = find_content_length(headers);
 
         if (clen < 0)
-        {   // 【L23】赖皮客人报负数 —— 不防的话 substr 会拿负数当巨大无符号数，直接崩
+        {
             LOG_WARN("客人 %d 的 Content-Length 是负数（%d），收桌", fd, clen);
             send_error_and_close(fd, "400 Bad Request", "<h1>400 别报假数</h1>");
             return;
         }
 
         if (inb.size() < pos + 4 + (size_t)clen)
-        {   // 【L23 核心】头齐了但身子没到齐 → 半包，留在便签上接着等
+        {
             LOG_INFO("客人 %d 的身子还差 %zu 字节，接着等", fd, pos + 4 + (size_t)clen - inb.size());
             break;
         }
 
-        std::string req  = inb.substr(0, pos + 4);               // 头（含空行）
-        std::string body = inb.substr(pos + 4, (size_t)clen);     // 【L23】身子切出来
-        inb.erase(0, pos + 4 + (size_t)clen);                     // 划掉整条：头+空行+身子
+        std::string req  = inb.substr(0, pos + 4);
+        std::string body = inb.substr(pos + 4, (size_t)clen);
+        inb.erase(0, pos + 4 + (size_t)clen);
 
         char method[16] = {0}, path[256] = {0};
         int cnt = sscanf(req.c_str(), "%15s %255s", method, path);
@@ -395,7 +384,8 @@ void do_read(int fd)
 
         bool keep_alive = (req.find("Connection: close") == std::string::npos);
         LOG_INFO("厨师做菜：客人 %d 点 %s %s（身子 %d 字节）", fd, method, path, clen);
-        handle_request(fd, method, path, body, keep_alive);        // 【L23】多传一个 body
+        std::string resp = handle_request(method, path, body, keep_alive);   // 【L25】做菜
+        write(fd, resp.data(), resp.size());                                // 【L25】上菜（部分写问题 L27 用循环写解决）
         last_active[fd] = time(nullptr);
 
         if (!keep_alive)
@@ -406,11 +396,19 @@ void do_read(int fd)
         }
     }
 
-    // ----- 阶段三：挂回（哪怕什么都没切出来也必须挂回！）-----（原样不动）
+    // ----- 挂回（哪怕什么都没切出来也必须挂回！）-----
     epoll_event ev{};
     ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
     ev.data.fd = fd;
     epoll_ctl(g_epfd, EPOLL_CTL_MOD, fd, &ev);
+}
+
+// ========== 【L25】Reactor 模式派单入口：厨师全包（读 + 做菜）==========
+// 行为跟原来的 do_read 一模一样，等于没变
+void do_reactor(int fd)
+{
+    if (!fetch_request(fd)) return;
+    do_logic(fd);
 }
 
 int main() 
@@ -501,14 +499,27 @@ int main()
                     last_active[fd] = time(nullptr);
                 }
             } 
-            else 
+            else
             {
                 int fd = events[i].data.fd;
                 if (last_active[fd] == 0) continue;   // 保险丝：过期事件跳过
-                Task t;
-                t.func = [fd] { do_read(fd); };       // 派单给厨师
-                threadpool_add(g_pool, t);
+                if (g_actor == 0)
+                {
+                    // Reactor：桌号扔给厨师，读和做菜全他包
+                    Task t;
+                    t.func = [fd] { do_reactor(fd); };
+                    threadpool_add(g_pool, t);
+                }
+                else
+                {
+                    // 【L25】Proactor：主线程自己把数据读干净，只把"做菜"派给厨师
+                    if (!fetch_request(fd)) continue;   // 桌子在主线程手里就收了，不用派
+                    Task t;
+                    t.func = [fd] { do_logic(fd); };
+                    threadpool_add(g_pool, t);
+                }
             }
+
         }
     }
 
