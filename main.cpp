@@ -31,8 +31,21 @@ void on_signal(int) { g_stop = 1; }
 time_t last_active[1024] = {0};
 ThreadPool* g_pool = nullptr;
 int g_epfd = -1;
-int g_actor = 1;    // 【L25】模式开关：0 = Reactor（厨师全包），1 = Proactor（主线程管读，厨师纯做菜）
-                    // 先写死变量，L29 学 config 时换成命令行参数 -a
+int g_actor = 1;    // 【L25】模式开关：0 = Reactor（厨师全包），1 = Proactor（主线程管读，厨师纯做菜）// 先写死变量，L29 学 config 时换成命令行参数 -a
+int g_et_mode = 1;   // 【L26】LT/ET 四组合开关
+                     //   bit0 = listenfd 用 ET？（0=LT  1=ET）
+                     //   bit1 = connfd   用 ET？（0=LT  1=ET）
+                     //   m=0 → 全LT m=1 → LT+ET（推荐，原版默认）
+                     //   m=2 → ET+LT   m=3 → 全ET（你之前的写法）
+                     // 先写死变量，L29 学 config 时换成命令行 -m
+
+// ========== 【L26】connfd 的事件模板（按 g_et_mode 拼出 4 种之一）==========
+uint32_t conn_events()
+{
+    uint32_t e = EPOLLIN | EPOLLONESHOT;
+    if (g_et_mode & 2) e |= EPOLLET;   // bit1 决定 connfd 是 LT 还是 ET
+    return e;
+}
 
 std::mutex g_log_lock;    // log.h 里 extern 声明的锁，本体在这
 
@@ -396,9 +409,9 @@ void do_logic(int fd)
         }
     }
 
-    // ----- 挂回（哪怕什么都没切出来也必须挂回！）-----
+        // ----- 挂回（哪怕什么都没切出来也必须挂回！）-----
     epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    ev.events = conn_events();   // 【L26】同 accept 时的模板
     ev.data.fd = fd;
     epoll_ctl(g_epfd, EPOLL_CTL_MOD, fd, &ev);
 }
@@ -432,6 +445,9 @@ int main()
     set_nonblocking(listen_fd);
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    // 【L26】l_onoff=1 + l_linger=0 → close 立即返回，丢未发数据，但端口能立刻 rebind（不卡 SO_REUSEADDR）
+    struct linger lg = {1, 0};
+    setsockopt(listen_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -445,7 +461,7 @@ int main()
     g_epfd = epoll_create1(0);
 
     epoll_event ev{};
-    ev.events = EPOLLIN | EPOLLET;
+    ev.events = EPOLLIN | ((g_et_mode & 1) ? EPOLLET : 0);   // 【L26】bit0 决定 listenfd 是 LT 还是 ET
     ev.data.fd = listen_fd;
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, listen_fd, &ev);
 
@@ -492,8 +508,11 @@ int main()
                     if (fd >= 1024) { close(fd); continue; }
                     LOG_INFO("新客人来了！桌号 %d", fd);
                     set_nonblocking(fd);
+                    // 【L26】l_onoff=1 + l_linger=1 → close 时等 1 秒把缓冲发完，关停时不丢响应
+                    struct linger lg = {1, 1};
+                    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
                     g_conns[fd].inbuf.clear();   // 【L21 关键】桌号复用！新客人进门先清便签
-                    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                    ev.events = conn_events();   // 【L26】按 4 组合之一挂监听
                     ev.data.fd = fd;
                     epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
                     last_active[fd] = time(nullptr);
@@ -523,10 +542,20 @@ int main()
         }
     }
 
-    threadpool_destroy(g_pool);
-    SqlConnPool::Instance().Close();   // L22: 关服务器时回收销毁钥匙
-    close(listen_fd);
-    close(g_epfd);
-    LOG_INFO("我的 epoll+线程池 服务器已关闭！");
+    // ===== 【L26】优雅关停：让正在服务的客人收到响应，再收摊 =====
+    LOG_INFO("【L26】收到退出信号，开始优雅关停...");
+    close(listen_fd);    // 1. 关门——不再接新客人（内核给后续 connect 发 RST）
+    for (int fd = 0; fd < 1024; fd++)    // 2. 给每张还开着的桌子发"半关闭"+close
+    {
+        if (last_active[fd] != 0)
+        {
+            shutdown(fd, SHUT_WR);    // 先告诉客人"我这边没数据要发了"，让 TA 能正常断开
+            close_conn(fd);           // SO_LINGER(1) 让 close 等 1 秒把缓冲发完
+        }
+    }
+    threadpool_destroy(g_pool);       // 3. 等所有厨师把手头的菜做完
+    SqlConnPool::Instance().Close();   // 4. 销毁所有真钥匙
+    close(g_epfd);                     // 5. 关掉 epoll
+    LOG_INFO("【L26】服务器已优雅关闭！");
     return 0;
 }
