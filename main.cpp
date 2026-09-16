@@ -9,6 +9,10 @@
 #include <cstdlib>
 #include <csignal>
 #include <cerrno>
+#include <sys/mman.h>          // 【L27】mmap/munmap：把文件映射进内存，大文件不占进程堆
+#include <sys/stat.h>          // 【L27】stat：查文件大小、判断是不是目录
+#include <sys/uio.h>           // 【L27】writev + struct iovec：一把发多块不相邻的内存
+#include <strings.h>           // 【L27】strncasecmp：忽略大小写比较 HTTP 头
 #include <mutex>
 #include <string>              // 【L21】用 std::string 当请求缓冲
 #include <map>                 // 【L24】装表单拆出来的键值对
@@ -19,6 +23,7 @@
 const int TICK_SEC    = 3;
 const int TIMEOUT_SEC = 6;
 const int MAX_REQ_BUF = 8192;   // 【L21】单连接请求缓冲上限，防赖皮客人撑爆内存
+const char* DOC_ROOT = "./root";   // 【L27】静态资源根目录（发文件的起点）
 
 volatile sig_atomic_t g_tick = 0;
 void on_alarm(int) { g_tick = 1; alarm(TICK_SEC); }
@@ -49,12 +54,45 @@ uint32_t conn_events()
 
 std::mutex g_log_lock;    // log.h 里 extern 声明的锁，本体在这
 
-// ========== 【L21】每张桌子一张"点单便签"：没凑成完整请求的碎片堆这儿 ==========
-struct ConnCtx 
+// ========== 【L27】解析状态机的"三态"和"三关" ==========
+// 从状态机：切一行时，这一行现在是 完整 / 坏了 / 还没收完？
+enum LineStatus { LINE_OK, LINE_BAD, LINE_OPEN };
+// 主状态机：我现在在解 HTTP 的哪一段？
+enum CheckState { CHECK_REQUESTLINE, CHECK_HEADER, CHECK_CONTENT };
+
+// 返回值：数据不够继续等 / 完整请求到手 / 格式非法拒收
+const int NO_REQUEST  = 0;
+const int GET_REQUEST = 1;
+const int BAD_REQUEST = 2;
+
+// ========== 【L21】每张桌子一张"点单便签"（【L27】升级成"连接大脑"）==========
+struct ConnCtx
 {
-    std::string inbuf;
+    std::string inbuf;                  // 收进来的原始字节（可累加）
+    size_t checked_idx = 0;             // 从状态机扫到哪了（下次接着扫，不回头）
+    size_t start_line  = 0;             // 当前这行的起点
+    size_t body_start  = 0;             // 身子的起点（头解析完才知道）
+    int    check_state = CHECK_REQUESTLINE;   // 主状态机当前在哪一关
+    int    content_len = 0;             // 头里读到的 Content-Length
+    std::string method, url, body;      // 解析成果：方法 / 路径 / 身子
+    bool   keep_alive  = true;          // 读到 Connection: close 就翻成 false
 };
 ConnCtx g_conns[1024];
+
+// ========== 【L27】把一张桌子恢复成"刚坐下"（新客人进门 / 一条请求消费完都要调）==========
+// 注意：这里不动 inbuf！粘包时 inbuf 里可能还躺着下一条请求，清了就丢数据
+void reset_conn(ConnCtx& c)
+{
+    c.checked_idx = 0;
+    c.start_line  = 0;
+    c.body_start  = 0;
+    c.check_state = CHECK_REQUESTLINE;
+    c.content_len = 0;
+    c.method.clear();
+    c.url.clear();
+    c.body.clear();
+    c.keep_alive  = true;
+}
 
 // ========== 响应工厂（【L25】升级：返回 std::string，不再受栈缓冲 8K 上限）==========
 std::string make_response_str(const char* status, const char* body, bool keep_alive)
@@ -69,20 +107,6 @@ std::string make_response_str(const char* status, const char* body, bool keep_al
         status, strlen(body),
         keep_alive ? "keep-alive" : "close");
     return std::string(head, hl) + body;    // 头（精确长度）拼接身子
-}
-
-// ========== 【L23】从请求头里找 Content-Length 的数值 ==========
-int find_content_length(const std::string& headers)
-{
-    // 请求头里长这样：Content-Length: 25   （数字前有个空格，atoi 自己会跳过）
-    const char* keys[2] = { "Content-Length:", "content-length:" };  // 大小写各试一遍
-    for (int k = 0; k < 2; k++) 
-    {
-        size_t p = headers.find(keys[k]);
-        if (p != std::string::npos) 
-            return atoi(headers.c_str() + p + strlen(keys[k]));
-    }
-    return 0;   // 头里没写 = 当 0（GET 请求就是这样）
 }
 
 // ========== 【L23】URL 解码：把 %41 还原成字母 A，把 + 还原成空格 ==========
@@ -129,6 +153,129 @@ void parse_form(const std::string& body, std::map<std::string, std::string>& out
         }
         start = amp + 1;
     }
+}
+
+// ======================================================================
+// 【L27】主从状态机解 HTTP —— 原版 TinyWebServer 的核心解析器
+//   从状态机 parse_line：只管"帮我切出一行完整的话"（逐字节扫 \r\n）
+//   主状态机 process_read：按 请求行 → 头 → 身子 三关往前走
+//   好处：① 数据分几次到都行（半包天然支持）② 一次收到多条能连着解（粘包）
+// ======================================================================
+
+// ---------- 从状态机：切出一行 ----------
+// 返回 LINE_OK 时，[line_start, line_end) 就是这一行的内容
+int parse_line(ConnCtx& c, size_t& line_start, size_t& line_end)
+{
+    for (size_t i = c.checked_idx; i < c.inbuf.size(); i++)
+    {
+        char ch = c.inbuf[i];
+        if (ch == '\r')
+        {
+            if (i + 1 == c.inbuf.size())
+                return LINE_OPEN;               // \r 是最后一个字节，\n 还没到，等下一趟
+            if (c.inbuf[i + 1] == '\n')
+            {
+                line_start = c.start_line;      // 这行从 start_line 开始
+                line_end   = i;                 // 到 \r 结束（\r\n 本身不算内容）
+                c.checked_idx = i + 2;          // 下次从 \n 的后面接着扫
+                c.start_line  = i + 2;
+                return LINE_OK;
+            }
+            return LINE_BAD;                    // \r 后面不是 \n = 这不是合法 HTTP 行
+        }
+        else if (ch == '\n')
+            return LINE_BAD;                    // 光有个 \n（前面没 \r）= 非法
+    }
+    return LINE_OPEN;                           // 扫到底也没见 \r\n，这行还没收完
+}
+
+// ---------- 主状态机第一关：请求行 "GET /hello HTTP/1.1" ----------
+int parse_request_line(ConnCtx& c, const std::string& text)
+{
+    size_t sp1 = text.find(' ');                // 第一个空格：方法 | URL
+    if (sp1 == std::string::npos) return BAD_REQUEST;
+    size_t sp2 = text.find(' ', sp1 + 1);       // 第二个空格：URL | 版本
+    if (sp2 == std::string::npos) return BAD_REQUEST;
+
+    c.method = text.substr(0, sp1);
+    c.url    = text.substr(sp1 + 1, sp2 - sp1 - 1);
+    std::string version = text.substr(sp2 + 1);
+
+    if (c.method != "GET" && c.method != "POST") return BAD_REQUEST;
+    if (version != "HTTP/1.1") return BAD_REQUEST;
+    if (c.url.empty() || c.url[0] != '/') return BAD_REQUEST;
+
+    c.check_state = CHECK_HEADER;               // 过关！进第二关
+    return NO_REQUEST;
+}
+
+// ---------- 主状态机第二关：一行一个头 ----------
+int parse_headers(ConnCtx& c, const std::string& text)
+{
+    if (text.empty())                           // 空行 = 头到头了
+    {
+        c.body_start = c.start_line;            // 身子从下一行开始（GET 时它=整条请求长度）
+        if (c.content_len > 0)
+        {
+            c.check_state = CHECK_CONTENT;      // 过关！进第三关等身子
+            return NO_REQUEST;
+        }
+        return GET_REQUEST;                     // 没身子 = 菜齐了，开做
+    }
+    if (strncasecmp(text.c_str(), "Content-Length:", 15) == 0)
+    {
+        c.content_len = atoi(text.c_str() + 15);
+        if (c.content_len < 0) return BAD_REQUEST;   // 【L23 防赖皮】负数 = 假报告，拒收
+    }
+    else if (strncasecmp(text.c_str(), "Connection:", 11) == 0)
+    {
+        const char* v = text.c_str() + 11;
+        while (*v == ' ' || *v == '\t') v++;    // 跳过 ":  close" 里的空格
+        if (strncasecmp(v, "close", 5) == 0) c.keep_alive = false;
+    }
+    return NO_REQUEST;
+}
+
+// ---------- 主状态机第三关：身子（按 Content-Length 数字节，不看 \r\n！）----------
+int parse_content(ConnCtx& c)
+{
+    if (c.inbuf.size() >= c.body_start + (size_t)c.content_len)
+    {
+        c.body = c.inbuf.substr(c.body_start, (size_t)c.content_len);
+        return GET_REQUEST;
+    }
+    return NO_REQUEST;                          // 身子还差几字节，等着
+}
+
+// ---------- 主状态机：把三关串成一个循环 ----------
+int process_read(ConnCtx& c)
+{
+    int line_status = LINE_OK;
+    int ret = NO_REQUEST;
+    size_t ls = 0, le = 0;
+
+    while ((c.check_state == CHECK_CONTENT && line_status == LINE_OK)
+           || (line_status = parse_line(c, ls, le)) == LINE_OK)
+    {
+        if (c.check_state == CHECK_REQUESTLINE)
+        {
+            ret = parse_request_line(c, c.inbuf.substr(ls, le - ls));
+            if (ret == BAD_REQUEST) return BAD_REQUEST;
+        }
+        else if (c.check_state == CHECK_HEADER)
+        {
+            ret = parse_headers(c, c.inbuf.substr(ls, le - ls));
+            if (ret == BAD_REQUEST) return BAD_REQUEST;
+            if (ret == GET_REQUEST) return GET_REQUEST;
+        }
+        else if (c.check_state == CHECK_CONTENT)
+        {
+            ret = parse_content(c);
+            if (ret == GET_REQUEST) return GET_REQUEST;
+            line_status = LINE_OPEN;    // 身子不看行，这一趟到此为止
+        }
+    }
+    return NO_REQUEST;   // 数据还不够，便签收好等下一趟（半包就是这么消化的）
 }
 
 // ========== 路由（【L25】只做菜不上菜：返回响应字符串，write 移出去）==========
@@ -314,15 +461,103 @@ void close_conn(int fd)
     close(fd);
     last_active[fd] = 0;
     g_conns[fd].inbuf.clear();   // 不清 = 给下一位坐这个桌号的客人留垃圾
+    reset_conn(g_conns[fd]);     // 【L27】状态机也归零，别带着上一位客人的解析进度
 }
 
-// ========== 【L21】发个错误响应再收桌 ==========
-// ========== 【L21】发个错误响应再收桌（【L25】顺手摆脱 1024 栈缓冲）==========
+// ========== 【L27】循环写：把一段内存完整发出去（对付"部分写"）==========
+// 为什么需要：write 语义是"尽力发"，socket 缓冲满了就只发一部分并返回已发字节数；
+//             大响应一次 write 发不完，剩下的必须接着发，否则客户端收到的是半截 HTML。
+bool send_all(int fd, const char* data, size_t len)
+{
+    size_t sent = 0;
+    while (sent < len)
+    {
+        ssize_t n = write(fd, data + sent, len - sent);
+        if (n > 0) { sent += n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            // 教学版：缓冲满了眯 1 毫秒再试（简单有效）
+            // 原版是把"没发完的偏移"记下来、改成监听 EPOLLOUT，等内核说"能写了"再发
+            usleep(1000);
+            continue;
+        }
+        LOG_WARN("fd %d 发送失败 errno=%d", fd, errno);
+        return false;
+    }
+    return true;
+}
+
+// ========== 【L21】发个错误响应再收桌（【L25】摆脱 1024 栈缓冲，【L27】改用循环写）==========
 void send_error_and_close(int fd, const char* status, const char* body)
 {
     std::string resp = make_response_str(status, body, false);
-    write(fd, resp.data(), resp.size());
+    send_all(fd, resp.data(), resp.size());
     close_conn(fd);
+}
+
+// ========== 【L27】发静态文件：mmap 映射 + writev 一次发"头 + 文件体" ==========
+// 为什么用 mmap：39M 视频映射成一段内存，内核按需从磁盘投喂页，进程堆里不会出现 39M 的分配；
+//               用 read + malloc 的老办法，得先申请 39M 再发。
+// 为什么用 writev：响应头在用户态缓冲、文件体在内核页缓存，两块内存不相邻，
+//                  writev 一次系统调用全发出去，不用 memcpy 拼成一大块（原版同款）。
+bool serve_static(int fd, const char* url, bool keep_alive)
+{
+    std::string u = url;
+    if (u.rfind("/static/", 0) != 0) return false;        // 只接管 /static/ 开头的
+    if (u.find("..") != std::string::npos) return false;  // 防目录穿越：/static/../../etc/passwd
+    std::string path = std::string(DOC_ROOT) + u.substr(7);  // "/static/a.bin" -> "./root/a.bin"
+
+    struct stat st{};
+    if (stat(path.c_str(), &st) < 0) return false;        // 文件不存在 -> 交回路由去 404
+    if (S_ISDIR(st.st_mode)) return false;
+    int ffd = open(path.c_str(), O_RDONLY);
+    if (ffd < 0) return false;
+
+    char* addr = (char*)mmap(nullptr, st.st_size, PROT_READ, MAP_PRIVATE, ffd, 0);
+    close(ffd);                     // 【原版同款】映射建好后 fd 就能关，映射还在
+    if (addr == MAP_FAILED) { LOG_ERROR("mmap 失败"); return false; }
+
+    char head[256];
+    int hl = snprintf(head, sizeof(head),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Content-Length: %ld\r\n"
+        "Connection: %s\r\n\r\n",
+        (long)st.st_size, keep_alive ? "keep-alive" : "close");
+
+    struct iovec iv[2];
+    iv[0].iov_base = head;   iv[0].iov_len = hl;           // 第一块：响应头
+    iv[1].iov_base = addr;   iv[1].iov_len = st.st_size;   // 第二块：文件体（映射来的）
+
+    size_t total = hl + st.st_size, sent = 0;
+    while (sent < total)
+    {
+        ssize_t n = writev(fd, iv, 2);                     // 一把发两块
+        if (n < 0)
+        {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(1000); continue; }
+            break;
+        }
+        sent += n;
+        // 【原版同款"剪枝"】把已经发出去的字节从 iovec 上剪掉，剩下的下次接着发
+        if (sent >= iv[0].iov_len)
+        {
+            size_t body_sent = sent - iv[0].iov_len;
+            iv[0].iov_len  = 0;
+            iv[1].iov_base = addr + body_sent;
+            iv[1].iov_len  = st.st_size - body_sent;
+        }
+        else
+        {
+            iv[0].iov_base = head + sent;
+            iv[0].iov_len  = hl - sent;
+        }
+    }
+    munmap(addr, st.st_size);       // 发完必须解映射，不然映射区越积越多
+    LOG_INFO("【L27】静态文件 %s（%ld 字节）mmap+writev 发完", path.c_str(), (long)st.st_size);
+    return true;
 }
 
 // ========== 【L25】阶段一单独抽出来：纯搬运（读 socket -> 便签）==========
@@ -357,51 +592,52 @@ bool fetch_request(int fd)
     return true;    // 读完了，数据在便签上
 }
 
-// ========== 【L25】阶段二 + 上菜：纯做菜（切请求 -> 路由 -> write），一字不读 ==========
+// ========== 【L25】阶段二 + 上菜：纯做菜（【L27】状态机切请求 -> 路由/静态文件 -> 发送）==========
 void do_logic(int fd)
 {
+    ConnCtx& c = g_conns[fd];
+
     while (true)
     {
-        std::string& inb = g_conns[fd].inbuf;
-        size_t pos = inb.find("\r\n\r\n");
-        if (pos == std::string::npos) break;
+        int ret = process_read(c);
 
-        std::string headers = inb.substr(0, pos);
-        int clen = find_content_length(headers);
-
-        if (clen < 0)
+        if (ret == NO_REQUEST)                   // 数据不够
         {
-            LOG_WARN("客人 %d 的 Content-Length 是负数（%d），收桌", fd, clen);
-            send_error_and_close(fd, "400 Bad Request", "<h1>400 别报假数</h1>");
-            return;
-        }
-
-        if (inb.size() < pos + 4 + (size_t)clen)
-        {
-            LOG_INFO("客人 %d 的身子还差 %zu 字节，接着等", fd, pos + 4 + (size_t)clen - inb.size());
+            if (!c.inbuf.empty())
+                LOG_INFO("客人 %d 的数据还没到齐（便签上 %zu 字节），等下一趟", fd, c.inbuf.size());
             break;
         }
-
-        std::string req  = inb.substr(0, pos + 4);
-        std::string body = inb.substr(pos + 4, (size_t)clen);
-        inb.erase(0, pos + 4 + (size_t)clen);
-
-        char method[16] = {0}, path[256] = {0};
-        int cnt = sscanf(req.c_str(), "%15s %255s", method, path);
-        if (cnt != 2)
+        if (ret == BAD_REQUEST)
         {
-            LOG_WARN("客人 %d 请求格式看不懂，收桌", fd);
+            LOG_WARN("客人 %d 的请求格式不合法，收桌", fd);
             send_error_and_close(fd, "400 Bad Request", "<h1>400 听不懂你在说什么</h1>");
             return;
         }
 
-        bool keep_alive = (req.find("Connection: close") == std::string::npos);
-        LOG_INFO("厨师做菜：客人 %d 点 %s %s（身子 %d 字节）", fd, method, path, clen);
-        std::string resp = handle_request(method, path, body, keep_alive);   // 【L25】做菜
-        write(fd, resp.data(), resp.size());                                // 【L25】上菜（部分写问题 L27 用循环写解决）
+        // ret == GET_REQUEST：菜齐了
+        size_t total = c.body_start + (size_t)c.content_len;   // 这条请求一共占多少字节
+        LOG_INFO("厨师做菜：客人 %d 点 %s %s（身子 %d 字节，这条共 %zu 字节）",
+                 fd, c.method.c_str(), c.url.c_str(), c.content_len, total);
+
+        // 【L27】先看是不是要静态文件（/static/xxx）；不是再走路由
+        if (!serve_static(fd, c.url.c_str(), c.keep_alive))
+        {
+            std::string resp = handle_request(c.method.c_str(), c.url.c_str(), c.body, c.keep_alive);
+            if (!send_all(fd, resp.data(), resp.size()))
+            {
+                LOG_WARN("客人 %d 发送失败，收桌", fd);
+                close_conn(fd);
+                return;
+            }
+        }
+
         last_active[fd] = time(nullptr);
 
-        if (!keep_alive)
+        bool ka = c.keep_alive;      // 【坑】先存下来！下面 reset_conn 会把它刷回 true
+        c.inbuf.erase(0, total);     // 消费掉这条请求占的字节
+        reset_conn(c);               // 状态机归零，准备吃下一条（粘在一起的那条）
+
+        if (!ka)
         {
             LOG_INFO("客人 %d 说了 close，收桌", fd);
             close_conn(fd);
@@ -409,7 +645,7 @@ void do_logic(int fd)
         }
     }
 
-        // ----- 挂回（哪怕什么都没切出来也必须挂回！）-----
+    // ----- 挂回（哪怕什么都没切出来也必须挂回！）-----
     epoll_event ev{};
     ev.events = conn_events();   // 【L26】同 accept 时的模板
     ev.data.fd = fd;
@@ -507,11 +743,16 @@ int main()
                     }
                     if (fd >= 1024) { close(fd); continue; }
                     LOG_INFO("新客人来了！桌号 %d", fd);
+                    
                     set_nonblocking(fd);
+
                     // 【L26】l_onoff=1 + l_linger=1 → close 时等 1 秒把缓冲发完，关停时不丢响应
                     struct linger lg = {1, 1};
                     setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+
                     g_conns[fd].inbuf.clear();   // 【L21 关键】桌号复用！新客人进门先清便签
+                    reset_conn(g_conns[fd]);     // 【L27】状态机归零
+
                     ev.events = conn_events();   // 【L26】按 4 组合之一挂监听
                     ev.data.fd = fd;
                     epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
