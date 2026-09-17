@@ -44,6 +44,9 @@ int g_et_mode = 1;   // 【L26】LT/ET 四组合开关
                      //   m=2 → ET+LT   m=3 → 全ET（你之前的写法）
                      // 先写死变量，L29 学 config 时换成命令行 -m
 
+int g_log_async = 1;   // 【L28】日志模式开关：0 = 同步直写，1 = 异步队列
+                       // 先写死变量，L29 学 config 时换成命令行参数 -l
+
 // ========== 【L26】connfd 的事件模板（按 g_et_mode 拼出 4 种之一）==========
 uint32_t conn_events()
 {
@@ -51,8 +54,6 @@ uint32_t conn_events()
     if (g_et_mode & 2) e |= EPOLLET;   // bit1 决定 connfd 是 LT 还是 ET
     return e;
 }
-
-std::mutex g_log_lock;    // log.h 里 extern 声明的锁，本体在这
 
 // ========== 【L27】解析状态机的"三态"和"三关" ==========
 // 从状态机：切一行时，这一行现在是 完整 / 坏了 / 还没收完？
@@ -662,6 +663,9 @@ void do_reactor(int fd)
 
 int main() 
 {
+    // 【L28】日志系统上岗（必须在第一条 LOG 之前！）
+    Log::get_instance()->init("ServerLog", 5000000, g_log_async ? 10000 : 0);
+
     SqlConnPool::Instance().Init("localhost", "web", "web123456", "tinywebdb", 8);   // 【L24】8 把真钥匙
 
     signal(SIGPIPE, SIG_IGN);
@@ -798,5 +802,6 @@ int main()
     SqlConnPool::Instance().Close();   // 4. 销毁所有真钥匙
     close(g_epfd);                     // 5. 关掉 epoll
     LOG_INFO("【L26】服务器已优雅关闭！");
+    Log::get_instance()->flush();   // 【L28】传送带排空 + 缓冲冲刷，一条日志都不丢
     return 0;
 }
