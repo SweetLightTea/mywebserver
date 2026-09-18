@@ -19,6 +19,8 @@
 #include "log.h"               // 【L19】日志宏
 #include "threadpool.h"        // 【L17】线程池
 #include "sql_connection_pool.h" //预处理器是从上到下顺序展开的。当处理到 sql_connection_pool.h 时，LOG_INFO 这个宏已经在 log.h 里定义过了，所以编译器认识它。
+#include "lock/locker.h"           // 【L29】三件套教学资产
+#include "config.h"         // 【L29】命令行 8 参数配置
 
 const int TICK_SEC    = 3;
 const int TIMEOUT_SEC = 6;
@@ -28,7 +30,7 @@ const char* DOC_ROOT = "./root";   // 【L27】静态资源根目录（发文件
 volatile sig_atomic_t g_tick = 0;
 void on_alarm(int) { g_tick = 1; alarm(TICK_SEC); }
 
-const int PORT = 9007;
+int PORT = 9007;
 const int MAX_EVENTS = 10;
 volatile sig_atomic_t g_stop = 0;
 void on_signal(int) { g_stop = 1; }
@@ -46,6 +48,8 @@ int g_et_mode = 1;   // 【L26】LT/ET 四组合开关
 
 int g_log_async = 1;   // 【L28】日志模式开关：0 = 同步直写，1 = 异步队列
                        // 先写死变量，L29 学 config 时换成命令行参数 -l
+
+int g_close_log = 0;   // 【L29】-c 开关
 
 // ========== 【L26】connfd 的事件模板（按 g_et_mode 拼出 4 种之一）==========
 uint32_t conn_events()
@@ -661,13 +665,32 @@ void do_reactor(int fd)
     do_logic(fd);
 }
 
-int main() 
+int main(int argc, char* argv[])
 {
-    // 【L28】日志系统上岗（必须在第一条 LOG 之前！）
-    Log::get_instance()->init("ServerLog", 5000000, g_log_async ? 10000 : 0);
+    // 【L29】命令行解析（必须在所有读 g_* 的代码之前）
+    Config c;
+    c.parse_arg(argc, argv);
+    LOG_INFO("[Config] 端口=%d 日志=%s 触发=%d linger=%d sql池=%d 线程=%d 关INFO=%d actor=%d",
+             c.PORT, c.LOGWrite?"异步":"同步", c.TRIGMode, c.OPT_LINGER,
+             c.sql_num, c.thread_num, c.close_log, c.actor_model);
 
-    SqlConnPool::Instance().Init("localhost", "web", "web123456", "tinywebdb", 8);   // 【L24】8 把真钥匙
+    // 【L29】把 c 灌进 5 个全局开关（parse_arg 没传时由 L39/L40/L47 默认值兜底）
+    PORT       = c.PORT;     
+    g_log_async = c.LOGWrite;
+    g_et_mode   = c.TRIGMode;
+    g_actor     = c.actor_model;
+    g_close_log = c.close_log;
 
+    // 【L29】删掉 L31 那行 `const int PORT = 9007;`
+    // MAX_EVENTS=10 / TICK_SEC=3 / TIMEOUT_SEC=6 这些是网络内限制，不挪
+    // ...后面 Log init / SqlConnPool / SO_LINGER / threadpool_create 都要换 ↓
+
+    // (1) Log init（替换 L667）
+    Log::get_instance()->init("ServerLog", 5000000, c.LOGWrite ? 10000 : 0);
+
+    // (2) SqlConnPool Init（替换 L669）—— 末参 8 → c.sql_num
+    SqlConnPool::Instance().Init("localhost", "web", "web123456", "tinywebdb", c.sql_num);
+    
     signal(SIGPIPE, SIG_IGN);
     signal(SIGALRM, on_alarm);
     alarm(TICK_SEC);
@@ -685,9 +708,12 @@ int main()
     set_nonblocking(listen_fd);
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    // 【L26】l_onoff=1 + l_linger=0 → close 立即返回，丢未发数据，但端口能立刻 rebind（不卡 SO_REUSEADDR）
-    struct linger lg = {1, 0};
-    setsockopt(listen_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    // (3) listenfd 的 SO_LINGER（替换 L690 那段 setsockopt）—— 用 if (c.OPT_LINGER) 包
+    if (c.OPT_LINGER) 
+    {
+        struct linger lg = {1, 0};
+        setsockopt(listen_fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -697,7 +723,8 @@ int main()
     if (listen(listen_fd, 5) < 0) { perror("listen"); exit(1); }
     LOG_INFO("我的 epoll+线程池 服务器已启动！ 端口 %d", PORT);
 
-    g_pool = threadpool_create(3);
+    // (5) threadpool_create（替换 L700）—— 3 → c.thread_num
+    g_pool = threadpool_create(c.thread_num);
     g_epfd = epoll_create1(0);
 
     epoll_event ev{};
@@ -750,9 +777,12 @@ int main()
                     
                     set_nonblocking(fd);
 
-                    // 【L26】l_onoff=1 + l_linger=1 → close 时等 1 秒把缓冲发完，关停时不丢响应
-                    struct linger lg = {1, 1};
-                    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+                    // (4) connfd 的 SO_LINGER（替换 L755 那段）—— 同样 if (c.OPT_LINGER) 包
+                    if (c.OPT_LINGER) 
+                    {
+                        struct linger lg = {1, 1};
+                        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+                    }
 
                     g_conns[fd].inbuf.clear();   // 【L21 关键】桌号复用！新客人进门先清便签
                     reset_conn(g_conns[fd]);     // 【L27】状态机归零

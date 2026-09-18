@@ -28,6 +28,7 @@
 #include <thread>
 #include "block_queue.h"
 
+extern int g_close_log;   // 【L29】-c 1 时关 INFO 日志
 class Log
 {
 public:
@@ -58,6 +59,8 @@ public:
 
     void write_log(int level, const char* format, ...)
     {
+        if (g_close_log && level == 1) return;   // -c 1：INFO 不写，WARN/ERROR 还写
+
         static const char* LEVELS[] = { "", "INFO", "WARN", "ERROR" };
         if (level < 1 || level > 3) level = 1;
 
