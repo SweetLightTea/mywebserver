@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-const int QUEUE_SIZE = 16;  // 最多挂 16 张小票（教学够用了）
+const int QUEUE_SIZE = 1024;  // 最多挂 16 张小票（教学够用了）
 
 struct Task 
 {
