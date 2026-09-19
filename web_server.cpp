@@ -18,7 +18,7 @@
 #include <map>                 // 【L24】装表单拆出来的键值对
 #include "log.h"               // 【L19】日志宏
 #include "threadpool.h"        // 【L17】线程池
-#include "sql_connection_pool.h" //预处理器是从上到下顺序展开的。当处理到 sql_connection_pool.h 时，LOG_INFO 这个宏已经在 log.h 里定义过了，所以编译器认识它。
+#include "sql_connection_pool.h"
 #include "lock/locker.h"           // 【L29】三件套教学资产
 #include "config.h"         // 【L29】命令行 8 参数配置
 #include "web_server.h"     // 【L30】自己的门面
@@ -33,10 +33,11 @@ void on_alarm(int) { g_tick = 1; alarm(TICK_SEC); }
 
 int PORT = 9007;
 const int MAX_EVENTS = 1024;
+const int MAX_FD = 65536;   // 【加固】桌子数上限：1024 → 65536，冲 10500 并发
 volatile sig_atomic_t g_stop = 0;
 void on_signal(int) { g_stop = 1; }
 
-time_t last_active[1024] = {0};
+time_t last_active[MAX_FD] = {0};
 ThreadPool* g_pool = nullptr;
 int g_epfd = -1;
 int g_actor = 1;    // 【L25】模式开关：0 = Reactor（厨师全包），1 = Proactor（主线程管读，厨师纯做菜）// 先写死变量，L29 学 config 时换成命令行参数 -a
@@ -83,7 +84,7 @@ struct ConnCtx
     std::string method, url, body;      // 解析成果：方法 / 路径 / 身子
     bool   keep_alive  = true;          // 读到 Connection: close 就翻成 false
 };
-ConnCtx g_conns[1024];
+ConnCtx g_conns[MAX_FD];
 
 // ========== 【L27】把一张桌子恢复成"刚坐下"（新客人进门 / 一条请求消费完都要调）==========
 // 注意：这里不动 inbuf！粘包时 inbuf 里可能还躺着下一条请求，清了就丢数据
@@ -208,7 +209,8 @@ int parse_request_line(ConnCtx& c, const std::string& text)
     std::string version = text.substr(sp2 + 1);
 
     if (c.method != "GET" && c.method != "POST") return BAD_REQUEST;
-    if (version != "HTTP/1.1") return BAD_REQUEST;
+    if (version != "HTTP/1.1" && version != "HTTP/1.0") return BAD_REQUEST;
+    if (version == "HTTP/1.0") c.keep_alive = false;   // 【L30】1.0 默认说完就散，别挂着等下一条
     if (c.url.empty() || c.url[0] != '/') return BAD_REQUEST;
 
     c.check_state = CHECK_HEADER;               // 过关！进第二关
@@ -238,6 +240,7 @@ int parse_headers(ConnCtx& c, const std::string& text)
         const char* v = text.c_str() + 11;
         while (*v == ' ' || *v == '\t') v++;    // 跳过 ":  close" 里的空格
         if (strncasecmp(v, "close", 5) == 0) c.keep_alive = false;
+        else if (strncasecmp(v, "keep-alive", 10) == 0) c.keep_alive = true;
     }
     return NO_REQUEST;
 }
@@ -739,7 +742,7 @@ void WebServer::run()
         {
             g_tick = 0;
             time_t now = time(nullptr);
-            for (int fd = 0; fd < 1024; fd++) 
+            for (int fd = 0; fd < MAX_FD; fd++) 
             {
                 if (last_active[fd] != 0 && now - last_active[fd] >= TIMEOUT_SEC) 
                 {
@@ -771,7 +774,7 @@ void WebServer::run()
                         if (errno == EINTR) continue;
                         break;                   // EAGAIN = 接完了
                     }
-                    if (fd >= 1024) { close(fd); continue; }
+                    if (fd >= MAX_FD) { close(fd); continue; }
                     LOG_INFO("新客人来了！桌号 %d", fd);
                     
                     set_nonblocking(fd);
@@ -819,7 +822,7 @@ void WebServer::run()
     // ===== 【L26】优雅关停：让正在服务的客人收到响应，再收摊 =====
     LOG_INFO("【L26】收到退出信号，开始优雅关停...");
     close(listen_fd);    // 1. 关门——不再接新客人（内核给后续 connect 发 RST）
-    for (int fd = 0; fd < 1024; fd++)    // 2. 给每张还开着的桌子发"半关闭"+close
+    for (int fd = 0; fd < MAX_FD; fd++)    // 2. 给每张还开着的桌子发"半关闭"+close
     {
         if (last_active[fd] != 0)
         {
